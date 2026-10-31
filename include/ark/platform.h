@@ -54,6 +54,9 @@ typedef struct {
 } ArkEvent;
 
 typedef struct {
+    /* Monotonic milliseconds. Only differences are meaningful. */
+    unsigned long now_ms;
+
     const ArkEvent *events;
     size_t event_count;
 } ArkInput;
@@ -65,7 +68,10 @@ typedef struct {
     const unsigned char *data;
     size_t length;
 
-    /* Close the connection once everything queued for it has been sent. */
+    /*
+     * Close the connection once everything queued for it has been sent.
+     * A send with length 0 and close_after set just closes the connection.
+     */
     int close_after;
 } ArkSend;
 

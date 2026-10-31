@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <ark/platform.h>
@@ -100,6 +101,13 @@ static int linux_join(char *dest, size_t dest_size, const char *a, const char *b
     memcpy(dest, a, a_length);
     memcpy(dest + a_length, b, b_length + 1);
     return 1;
+}
+
+static unsigned long linux_now_ms(void) {
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (unsigned long)now.tv_sec * 1000UL + (unsigned long)now.tv_nsec / 1000000UL;
 }
 
 static void *linux_allocate(size_t size) {
@@ -369,8 +377,10 @@ static void linux_queue_send(const ArkSend *item) {
         return;
     }
 
-    memcpy(slot->pending + slot->pending_start + slot->pending_length, item->data, item->length);
-    slot->pending_length += item->length;
+    if (item->length > 0) {
+        memcpy(slot->pending + slot->pending_start + slot->pending_length, item->data, item->length);
+        slot->pending_length += item->length;
+    }
 
     if (item->close_after) {
         slot->close_after_flush = 1;
@@ -617,6 +627,7 @@ int main(int argc, char **argv) {
 
         linux_report_closes(events, &event_count);
 
+        input.now_ms = linux_now_ms();
         input.events = events;
         input.event_count = event_count;
         output.sends = sends;
