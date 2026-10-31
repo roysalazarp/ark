@@ -2,9 +2,11 @@
 
 #define ARK_MEMORY_ALIGNMENT 16
 
+/*
+ * mem must already be zeroed. Zeroing it here would touch every page and
+ * force the OS to back the whole block with physical memory up front.
+ */
 void ark_memory_init(Memory *memory, void *mem, size_t mem_size) {
-    ark_memory_zero(mem, mem_size);
-
     memory->size = (size_t)mem_size;
     memory->start = mem;
     memory->current = mem;

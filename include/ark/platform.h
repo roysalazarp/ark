@@ -27,7 +27,7 @@ typedef struct {
     void *permanent;
     size_t permanent_size;
 
-    /* Scratch space the app may throw away every tick. */
+    /* Scratch space the app may throw away every tick. Zeroed by the platform at startup. */
     void *transient;
     size_t transient_size;
 
