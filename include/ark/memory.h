@@ -3,7 +3,15 @@
 
 #include <stddef.h>
 
-void* ark_memory_allocate(size_t size);
-void ark_memory_free(void* memory);
+typedef struct {
+    size_t size;
+    size_t used;
+    void *start;
+    void *current;
+    int in_use;
+} Memory;
+
+void ark_memory_init(Memory *, void *, size_t);
+void ark_memory_reset(Memory *, void *);
 
 #endif

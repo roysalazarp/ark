@@ -4,7 +4,7 @@
             "name": "Linux",
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
-            "cStandard": "gnu17",
+            "cStandard": "c89",
             "cppStandard": "gnu++14",
             "intelliSenseMode": "linux-gcc-x64",
             "compilerArgs": [
