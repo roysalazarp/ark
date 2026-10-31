@@ -13,4 +13,7 @@ RUN apt-get install -y \
     libsqlite3-dev \
     gdb \
     valgrind \
+    wrk \
+    nodejs \
+    netcat-openbsd \
     && apt-get clean
