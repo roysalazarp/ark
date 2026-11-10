@@ -1,5 +1,9 @@
 #include <ark/platform.h>
 #include <ark/memory.h>
+#include <ark/text.h>
+#include <ark/http.h>
+#include <ark/postgres.h>
+#include <ark/upstream.h>
 
 /*
  * The app. It is loaded by a platform layer and only ever runs inside
@@ -7,547 +11,314 @@
  * so it survives the app being reloaded.
  */
 
-/* A whole request (headers and body) must fit in this buffer. */
-#define REQUEST_BUFFER_SIZE 8192
-#define RESPONSE_BUFFER_SIZE 4096
+/*
+ * The app has no password support, so it connects to a pooler that logs in to
+ * Postgres for it. See compose.yml. The platform says where the "db" endpoint is.
+ */
+#define DB_ENDPOINT "db"
+#define DB_USER "ark"
+#define DB_NAME "ark"
+/* Match default_pool_size in pgbouncer/pgbouncer.ini: more would only wait there. */
+#define DB_MAX_CONNECTIONS 20
+#define SLOW_QUERY "SELECT 'hello from postgres at ' || clock_timestamp()::text FROM pg_sleep(3)"
+#define HELLO_QUERY "SELECT 'hello, ' || $1::text"
+#define HELLO_PREFIX "/hello/"
+/* Returns $1 rows of 3 columns: a number, ten times it, and NULL or empty text. */
+#define ROWS_QUERY "SELECT n, n * 10, CASE WHEN n % 2 = 0 THEN NULL ELSE '' END FROM generate_series(1, $1::int) AS n"
+#define ROWS_PREFIX "/rows/"
 
-/* Close a connection that sends nothing between requests for this long. */
-#define IDLE_TIMEOUT_MS 5000
-/* Give up on a request that is still incomplete this long after its first byte. */
-#define REQUEST_TIMEOUT_MS 10000
-
-typedef struct {
-    int is_open;
-    /* The app has asked the platform to close it; ignore anything else it sends. */
-    int closing;
-    unsigned long last_active_ms;
-    unsigned long request_started_ms;
-    size_t request_length;
-    unsigned char request[REQUEST_BUFFER_SIZE];
-} Connection;
+/* Who owns each outbound id. See upstream.h. */
+enum {
+    OWNER_POSTGRES = 1
+};
 
 typedef struct {
     Memory permanent;
     Memory transient;
-    Connection *connections;
+    ArkHttp *http;
+    ArkPostgres *postgres;
+    /* The client waiting for each running query, indexed by query id. */
+    ArkHttpTicket query_tickets[ARK_PG_MAX_QUERIES];
+    ArkUpstreams upstreams;
 } AppState;
 
+/* Everything the app works with during one update. */
 typedef struct {
-    unsigned char *data;
-    size_t length;
-    size_t capacity;
-} Buffer;
-
-typedef enum {
-    PARSE_INCOMPLETE,
-    PARSE_OK,
-    PARSE_BAD_REQUEST,
-    PARSE_NOT_IMPLEMENTED,
-    PARSE_TOO_LARGE
-} ParseResult;
-
-typedef struct {
-    const unsigned char *method;
-    size_t method_length;
-    const unsigned char *path;
-    size_t path_length;
-    int keep_alive;
-    /* Headers plus body: how many bytes of the buffer this request uses. */
-    size_t total_length;
-} Request;
-
-/* ---- Strings ----------------------------------------------------------- */
-
-static size_t cstr_length(const char *s) {
-    size_t length = 0;
-
-    while (s[length] != '\0') {
-        ++length;
-    }
-
-    return length;
-}
-
-static unsigned char ascii_lower(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + ('a' - 'A')) : c;
-}
-
-static int bytes_equal_cstr(const unsigned char *bytes, size_t length, const char *s) {
-    size_t i;
-
-    for (i = 0; i < length; ++i) {
-        if (s[i] == '\0' || bytes[i] != (unsigned char)s[i]) {
-            return 0;
-        }
-    }
-
-    return s[length] == '\0';
-}
-
-/* s must be lowercase. */
-static int bytes_equal_cstr_ci(const unsigned char *bytes, size_t length, const char *s) {
-    size_t i;
-
-    for (i = 0; i < length; ++i) {
-        if (s[i] == '\0' || ascii_lower(bytes[i]) != (unsigned char)s[i]) {
-            return 0;
-        }
-    }
-
-    return s[length] == '\0';
-}
-
-static int is_whitespace(unsigned char c) {
-    return c == ' ' || c == '\t';
-}
-
-/* ---- Output ------------------------------------------------------------ */
+    AppState *state;
+    ArkAppMemory *memory;
+    ArkHttpContext http;
+    ArkPgContext pg;
+} Tick;
 
 static void app_log(ArkAppMemory *memory, const char *message) {
-    memory->platform.log(message, cstr_length(message));
+    memory->platform.log(message, ark_cstr_length(message));
 }
 
-static void buffer_append(Buffer *buffer, const void *data, size_t length) {
-    if (length > buffer->capacity - buffer->length) {
-        length = buffer->capacity - buffer->length;
-    }
-
-    ark_memory_copy(buffer->data + buffer->length, data, length);
-    buffer->length += length;
+static void respond(Tick *tick, const ArkHttpRequest *request, const char *status, const char *body) {
+    ark_http_respond(tick->state->http, &tick->http, request->conn_id, status, body);
 }
 
-static void buffer_append_cstr(Buffer *buffer, const char *s) {
-    buffer_append(buffer, s, cstr_length(s));
+static int path_has_prefix(const ArkHttpRequest *request, const char *prefix, size_t prefix_length) {
+    return request->path_length > prefix_length && ark_bytes_equal_cstr(request->path, prefix_length, prefix);
 }
 
-static void buffer_append_unsigned(Buffer *buffer, unsigned long value) {
-    char digits[20];
-    size_t count = 0;
+/* ---- Queries ----------------------------------------------------------- */
 
-    do {
-        digits[count++] = (char)('0' + value % 10);
-        value /= 10;
-    } while (value != 0);
+/* The client is answered when the result arrives. */
+static void start_query(Tick *tick, const ArkHttpRequest *request, const char *sql,
+                        const ArkPgValue *params, size_t param_count) {
+    AppState *state = tick->state;
+    unsigned long query_id;
+    ArkPgStart started;
 
-    while (count > 0) {
-        --count;
-        buffer_append(buffer, &digits[count], 1);
-    }
-}
-
-static void queue_send(ArkAppMemory *memory, ArkOutput *output, unsigned long conn_id,
-                       const unsigned char *data, size_t length, int close_after) {
-    ArkSend *send;
-
-    if (output->send_count >= output->send_capacity) {
-        app_log(memory, "app: output is full, dropping response");
+    if (state->postgres == NULL) {
+        respond(tick, request, "503 Service Unavailable", "No Database\n");
         return;
     }
 
-    send = &output->sends[output->send_count++];
-    send->conn_id = conn_id;
-    send->data = data;
-    send->length = length;
-    send->close_after = close_after;
-}
+    started = ark_pg_start(state->postgres, &tick->pg, sql, params, param_count, &query_id);
 
-static void respond(AppState *state, ArkAppMemory *memory, ArkOutput *output, unsigned long conn_id,
-                    const char *status, const char *body, int keep_alive) {
-    Buffer buffer;
-    size_t body_length = cstr_length(body);
-
-    /* Transient memory lives until the next update, as ArkSend requires. */
-    buffer.data = (unsigned char *)ark_memory_push(&state->transient, RESPONSE_BUFFER_SIZE);
-    buffer.length = 0;
-    buffer.capacity = RESPONSE_BUFFER_SIZE;
-
-    if (buffer.data == NULL) {
-        app_log(memory, "app: transient memory is full, dropping response");
+    if (started == ARK_PG_TOO_LARGE) {
+        respond(tick, request, "414 URI Too Long", "Too Long\n");
         return;
     }
 
-    buffer_append_cstr(&buffer, "HTTP/1.1 ");
-    buffer_append_cstr(&buffer, status);
-    buffer_append_cstr(&buffer, "\r\nContent-Type: text/plain\r\nContent-Length: ");
-    buffer_append_unsigned(&buffer, (unsigned long)body_length);
-    buffer_append_cstr(&buffer, keep_alive ? "\r\nConnection: keep-alive\r\n\r\n"
-                                           : "\r\nConnection: close\r\n\r\n");
-    buffer_append(&buffer, body, body_length);
-
-    queue_send(memory, output, conn_id, buffer.data, buffer.length, !keep_alive);
-}
-
-static void close_connection(ArkAppMemory *memory, ArkOutput *output, unsigned long conn_id,
-                             Connection *conn) {
-    queue_send(memory, output, conn_id, NULL, 0, 1);
-    conn->closing = 1;
-}
-
-/* Sends an error response, closes the connection and stops reading from it. */
-static void fail(AppState *state, ArkAppMemory *memory, ArkOutput *output, unsigned long conn_id,
-                 Connection *conn, const char *status) {
-    respond(state, memory, output, conn_id, status, status, 0);
-    conn->closing = 1;
-}
-
-/* ---- Parsing ----------------------------------------------------------- */
-
-/*
- * Finds the "\r\n" ending the line that starts at start. Rejects bare CR,
- * bare LF and NUL, which proxies and servers can disagree about.
- */
-static int find_line_end(const unsigned char *data, size_t limit, size_t start, size_t *line_end) {
-    size_t i = start;
-
-    while (i < limit && data[i] != '\r') {
-        if (data[i] == '\n' || data[i] == '\0') {
-            return 0;
-        }
-        ++i;
+    if (started == ARK_PG_BUSY) {
+        respond(tick, request, "503 Service Unavailable", "Too Many Queries\n");
+        return;
     }
 
-    if (i + 1 >= limit || data[i + 1] != '\n') {
-        return 0;
-    }
+    state->query_tickets[query_id] = ark_http_park(state->http, request->conn_id);
 
-    *line_end = i;
-    return 1;
-}
-
-static int parse_content_length(const unsigned char *value, size_t length, size_t *result) {
-    size_t number = 0;
-    size_t i;
-
-    if (length == 0) {
-        return 0;
-    }
-
-    for (i = 0; i < length; ++i) {
-        if (value[i] < '0' || value[i] > '9') {
-            return 0;
-        }
-
-        /* Anything this large is rejected later anyway; just avoid overflow. */
-        if (number > REQUEST_BUFFER_SIZE) {
-            number = REQUEST_BUFFER_SIZE + 1;
-            continue;
-        }
-        number = number * 10 + (size_t)(value[i] - '0');
-    }
-
-    *result = number;
-    return 1;
-}
-
-/* Looks for "close" and "keep-alive" in a comma-separated Connection value. */
-static void parse_connection(const unsigned char *value, size_t length,
-                             int *wants_close, int *wants_keep_alive) {
-    size_t start = 0;
-
-    while (start < length) {
-        size_t end = start;
-        size_t token_end;
-
-        while (end < length && value[end] != ',') {
-            ++end;
-        }
-
-        token_end = end;
-        while (start < token_end && is_whitespace(value[start])) {
-            ++start;
-        }
-        while (token_end > start && is_whitespace(value[token_end - 1])) {
-            --token_end;
-        }
-
-        if (bytes_equal_cstr_ci(value + start, token_end - start, "close")) {
-            *wants_close = 1;
-        } else if (bytes_equal_cstr_ci(value + start, token_end - start, "keep-alive")) {
-            *wants_keep_alive = 1;
-        }
-
-        start = end + 1;
-    }
-}
-
-/*
- * Parses the request at the start of data. Strict on purpose: anything a
- * proxy might read differently (bare LF, folded or spaced header names,
- * duplicate Content-Length, Transfer-Encoding) is rejected, because with
- * keep-alive a framing disagreement lets one request hide inside another.
- */
-static ParseResult parse_request(const unsigned char *data, size_t length, Request *request) {
-    size_t header_length = 0;
-    size_t content_length = 0;
-    int has_content_length = 0;
-    int wants_close = 0;
-    int wants_keep_alive = 0;
-    int is_http_1_0;
-    size_t line_start;
-    size_t line_end;
-    size_t i;
-
-    for (i = 0; i + 3 < length; ++i) {
-        if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
-            header_length = i + 4;
-            break;
-        }
-    }
-
-    if (header_length == 0) {
-        return PARSE_INCOMPLETE;
-    }
-
-    /* Request line: METHOD SP PATH SP VERSION */
-    if (!find_line_end(data, header_length, 0, &line_end)) {
-        return PARSE_BAD_REQUEST;
-    }
-
-    i = 0;
-    while (i < line_end && data[i] != ' ') {
-        ++i;
-    }
-    if (i == 0 || i == line_end) {
-        return PARSE_BAD_REQUEST;
-    }
-    request->method = data;
-    request->method_length = i;
-
-    line_start = ++i;
-    while (i < line_end && data[i] != ' ') {
-        ++i;
-    }
-    if (i == line_start || i == line_end) {
-        return PARSE_BAD_REQUEST;
-    }
-    request->path = data + line_start;
-    request->path_length = i - line_start;
-
-    ++i;
-    if (bytes_equal_cstr(data + i, line_end - i, "HTTP/1.1")) {
-        is_http_1_0 = 0;
-    } else if (bytes_equal_cstr(data + i, line_end - i, "HTTP/1.0")) {
-        is_http_1_0 = 1;
-    } else {
-        return PARSE_BAD_REQUEST;
-    }
-
-    /* Header lines, up to the blank line that ends the headers. */
-    for (line_start = line_end + 2; line_start < header_length - 2; line_start = line_end + 2) {
-        size_t name_end;
-        size_t value_start;
-        size_t value_end;
-
-        if (!find_line_end(data, header_length, line_start, &line_end)) {
-            return PARSE_BAD_REQUEST;
-        }
-
-        /* Obsolete line folding. */
-        if (is_whitespace(data[line_start])) {
-            return PARSE_BAD_REQUEST;
-        }
-
-        name_end = line_start;
-        while (name_end < line_end && data[name_end] != ':') {
-            if (is_whitespace(data[name_end])) {
-                return PARSE_BAD_REQUEST;
-            }
-            ++name_end;
-        }
-        if (name_end == line_start || name_end == line_end) {
-            return PARSE_BAD_REQUEST;
-        }
-
-        value_start = name_end + 1;
-        value_end = line_end;
-        while (value_start < value_end && is_whitespace(data[value_start])) {
-            ++value_start;
-        }
-        while (value_end > value_start && is_whitespace(data[value_end - 1])) {
-            --value_end;
-        }
-
-        if (bytes_equal_cstr_ci(data + line_start, name_end - line_start, "content-length")) {
-            if (has_content_length ||
-                !parse_content_length(data + value_start, value_end - value_start, &content_length)) {
-                return PARSE_BAD_REQUEST;
-            }
-            has_content_length = 1;
-        } else if (bytes_equal_cstr_ci(data + line_start, name_end - line_start, "transfer-encoding")) {
-            return PARSE_NOT_IMPLEMENTED;
-        } else if (bytes_equal_cstr_ci(data + line_start, name_end - line_start, "connection")) {
-            parse_connection(data + value_start, value_end - value_start, &wants_close, &wants_keep_alive);
-        }
-    }
-
-    if (content_length > REQUEST_BUFFER_SIZE - header_length) {
-        return PARSE_TOO_LARGE;
-    }
-
-    request->total_length = header_length + content_length;
-    if (length < request->total_length) {
-        return PARSE_INCOMPLETE;
-    }
-
-    /* HTTP/1.1 keeps the connection open by default; HTTP/1.0 only when asked. */
-    request->keep_alive = is_http_1_0 ? (wants_keep_alive && !wants_close) : !wants_close;
-
-    return PARSE_OK;
+    app_log(tick->memory, "app: query started");
 }
 
 /* ---- Requests ---------------------------------------------------------- */
 
-static void handle_request(AppState *state, ArkAppMemory *memory, ArkOutput *output,
-                           unsigned long conn_id, const Request *request) {
-    if (!bytes_equal_cstr(request->method, request->method_length, "GET")) {
-        respond(state, memory, output, conn_id, "405 Method Not Allowed", "Method Not Allowed\n",
-                request->keep_alive);
-    } else if (bytes_equal_cstr(request->path, request->path_length, "/")) {
-        respond(state, memory, output, conn_id, "200 OK", "Hello from Ark\n", request->keep_alive);
+static void handle_request(void *app, const ArkHttpRequest *request) {
+    Tick *tick = (Tick *)app;
+
+    if (!ark_bytes_equal_cstr(request->method, request->method_length, "GET")) {
+        respond(tick, request, "405 Method Not Allowed", "Method Not Allowed\n");
+    } else if (ark_bytes_equal_cstr(request->path, request->path_length, "/slow")) {
+        start_query(tick, request, SLOW_QUERY, NULL, 0);
+    } else if (path_has_prefix(request, HELLO_PREFIX, sizeof(HELLO_PREFIX) - 1)) {
+        ArkPgValue name;
+
+        name.data = request->path + sizeof(HELLO_PREFIX) - 1;
+        name.length = request->path_length - (sizeof(HELLO_PREFIX) - 1);
+
+        start_query(tick, request, HELLO_QUERY, &name, 1);
+    } else if (path_has_prefix(request, ROWS_PREFIX, sizeof(ROWS_PREFIX) - 1)) {
+        ArkPgValue count;
+
+        count.data = request->path + sizeof(ROWS_PREFIX) - 1;
+        count.length = request->path_length - (sizeof(ROWS_PREFIX) - 1);
+
+        start_query(tick, request, ROWS_QUERY, &count, 1);
+    } else if (ark_bytes_equal_cstr(request->path, request->path_length, "/")) {
+        respond(tick, request, "200 OK", "Hello from Ark\n");
     } else {
-        respond(state, memory, output, conn_id, "404 Not Found", "Not Found\n", request->keep_alive);
+        respond(tick, request, "404 Not Found", "Not Found\n");
     }
 }
 
-/* Handles every complete request in the buffer, in order. */
-static void process_requests(AppState *state, ArkAppMemory *memory, ArkOutput *output,
-                             unsigned long conn_id, Connection *conn, unsigned long now_ms) {
-    while (!conn->closing && conn->request_length > 0) {
-        Request request;
-        ParseResult result = parse_request(conn->request, conn->request_length, &request);
-        size_t remaining;
+/* ---- Results ----------------------------------------------------------- */
 
-        if (result == PARSE_INCOMPLETE) {
-            if (conn->request_length == REQUEST_BUFFER_SIZE) {
-                fail(state, memory, output, conn_id, conn, "431 Request Header Fields Too Large");
+static void log_query_result(Tick *tick, const ArkPgResult *result) {
+    ArkBuffer buffer;
+
+    if (!ark_buffer_push(&buffer, &tick->state->transient, ARK_PG_MESSAGE_SIZE + 128)) {
+        return;
+    }
+
+    if (result->status == ARK_PG_OK) {
+        ark_buffer_append_cstr(&buffer, "app: query finished after ");
+        ark_buffer_append_unsigned(&buffer, result->elapsed_ms);
+        ark_buffer_append_cstr(&buffer, " ms: ");
+        ark_buffer_append_unsigned(&buffer, (unsigned long)result->row_count);
+        ark_buffer_append_cstr(&buffer, " rows, ");
+        ark_buffer_append_unsigned(&buffer, (unsigned long)result->column_count);
+        ark_buffer_append_cstr(&buffer, " columns, count ");
+        ark_buffer_append_unsigned(&buffer, result->rows_affected);
+    } else {
+        ark_buffer_append_cstr(&buffer, "app: query failed after ");
+        ark_buffer_append_unsigned(&buffer, result->elapsed_ms);
+        ark_buffer_append_cstr(&buffer, " ms: ");
+        if (result->error_code[0] != '\0') {
+            ark_buffer_append_cstr(&buffer, "[");
+            ark_buffer_append_cstr(&buffer, result->error_code);
+            ark_buffer_append_cstr(&buffer, "] ");
+        }
+        ark_buffer_append_cstr(&buffer, result->error);
+    }
+
+    tick->memory->platform.log((const char *)buffer.data, buffer.length);
+}
+
+/* One line per row, values separated by tabs, NULL written as NULL. Returns NULL if out of memory. */
+static const char *format_rows(Tick *tick, const ArkPgResult *result) {
+    ArkPgValue value;
+    ArkBuffer buffer;
+    size_t size = 1;
+    size_t row;
+    size_t column;
+
+    for (row = 0; row < result->row_count; ++row) {
+        for (column = 0; column < result->column_count; ++column) {
+            ark_pg_value(result, row, column, &value);
+            size += (value.data == NULL ? 4 : value.length) + 1;
+        }
+        size += 1;
+    }
+
+    if (!ark_buffer_push(&buffer, &tick->state->transient, size)) {
+        return NULL;
+    }
+
+    for (row = 0; row < result->row_count; ++row) {
+        for (column = 0; column < result->column_count; ++column) {
+            ark_pg_value(result, row, column, &value);
+
+            if (column > 0) {
+                ark_buffer_append_cstr(&buffer, "\t");
             }
-            return;
-        }
 
-        if (result == PARSE_BAD_REQUEST) {
-            fail(state, memory, output, conn_id, conn, "400 Bad Request");
-            return;
-        }
-
-        if (result == PARSE_NOT_IMPLEMENTED) {
-            fail(state, memory, output, conn_id, conn, "501 Not Implemented");
-            return;
-        }
-
-        if (result == PARSE_TOO_LARGE) {
-            fail(state, memory, output, conn_id, conn, "413 Content Too Large");
-            return;
-        }
-
-        /* The response is built from the request now, before its bytes are discarded. */
-        handle_request(state, memory, output, conn_id, &request);
-        if (!request.keep_alive) {
-            conn->closing = 1;
-        }
-
-        /* Move any pipelined bytes to the front. dest < src, so a forward copy is safe. */
-        remaining = conn->request_length - request.total_length;
-        ark_memory_copy(conn->request, conn->request + request.total_length, remaining);
-        conn->request_length = remaining;
-        conn->request_started_ms = now_ms;
-    }
-}
-
-static void receive(AppState *state, ArkAppMemory *memory, ArkOutput *output,
-                    const ArkEvent *event, Connection *conn, unsigned long now_ms) {
-    const unsigned char *data = event->data;
-    size_t remaining = event->length;
-
-    conn->last_active_ms = now_ms;
-
-    /* A single read can hold more than the buffer when requests are pipelined. */
-    while (remaining > 0 && !conn->closing) {
-        size_t take = REQUEST_BUFFER_SIZE - conn->request_length;
-
-        if (take > remaining) {
-            take = remaining;
-        }
-
-        if (conn->request_length == 0) {
-            conn->request_started_ms = now_ms;
-        }
-
-        ark_memory_copy(conn->request + conn->request_length, data, take);
-        conn->request_length += take;
-        data += take;
-        remaining -= take;
-
-        process_requests(state, memory, output, event->conn_id, conn, now_ms);
-    }
-}
-
-static void check_timeouts(AppState *state, ArkAppMemory *memory, ArkOutput *output, unsigned long now_ms) {
-    unsigned long id;
-
-    for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
-        Connection *conn = &state->connections[id];
-
-        if (!conn->is_open || conn->closing) {
-            continue;
-        }
-
-        if (conn->request_length > 0) {
-            if (now_ms - conn->request_started_ms >= REQUEST_TIMEOUT_MS) {
-                fail(state, memory, output, id, conn, "408 Request Timeout");
+            if (value.data == NULL) {
+                ark_buffer_append_cstr(&buffer, "NULL");
+            } else {
+                ark_buffer_append(&buffer, value.data, value.length);
             }
-        } else if (now_ms - conn->last_active_ms >= IDLE_TIMEOUT_MS) {
-            close_connection(memory, output, id, conn);
         }
+        ark_buffer_append_cstr(&buffer, "\n");
     }
+
+    buffer.data[buffer.length] = '\0';
+    return (const char *)buffer.data;
+}
+
+static void resume(Tick *tick, ArkHttpTicket ticket, const char *status, const char *body) {
+    ark_http_resume(tick->state->http, &tick->http, ticket, status, body, handle_request, tick);
+}
+
+static void answer_query(Tick *tick, const ArkPgResult *result) {
+    ArkHttpTicket ticket = tick->state->query_tickets[result->query_id];
+
+    /* Nobody to answer, so skip building the body. */
+    if (!ark_http_is_parked(tick->state->http, ticket)) {
+        return;
+    }
+
+    if (result->status == ARK_PG_OK) {
+        const char *body = format_rows(tick, result);
+
+        if (body == NULL) {
+            resume(tick, ticket, "500 Internal Server Error", "Out Of Memory\n");
+        } else {
+            resume(tick, ticket, "200 OK", body);
+        }
+    } else if (result->status == ARK_PG_TIMEOUT) {
+        resume(tick, ticket, "504 Gateway Timeout", "Database Timeout\n");
+    } else if (ark_cstr_equal(result->error_code, "23505")) {
+        resume(tick, ticket, "409 Conflict", "Already Exists\n");
+    } else {
+        resume(tick, ticket, "502 Bad Gateway", "Database Error\n");
+    }
+}
+
+static void handle_query_results(Tick *tick) {
+    ArkPgResult result;
+
+    if (tick->state->postgres == NULL) {
+        return;
+    }
+
+    while (ark_pg_next_result(tick->state->postgres, &result)) {
+        log_query_result(tick, &result);
+        answer_query(tick, &result);
+    }
+}
+
+/* ---- Update ------------------------------------------------------------ */
+
+static int init(AppState *state, ArkAppMemory *memory) {
+    const ArkEndpoint *db_endpoint;
+
+    ark_memory_init(&state->permanent,
+                    (unsigned char *)memory->permanent + sizeof(AppState),
+                    memory->permanent_size - sizeof(AppState));
+    ark_memory_init(&state->transient, memory->transient, memory->transient_size);
+
+    state->http = ark_http_create(&state->permanent);
+    if (state->http == NULL) {
+        app_log(memory, "app: permanent memory is too small");
+        return 0;
+    }
+
+    db_endpoint = ark_find_endpoint(&memory->config, DB_ENDPOINT);
+    if (db_endpoint == NULL) {
+        app_log(memory, "app: no \"db\" endpoint, so database routes are off");
+        return 1;
+    }
+
+    state->postgres = ark_pg_create(&state->permanent, db_endpoint, OWNER_POSTGRES, DB_MAX_CONNECTIONS,
+                                    DB_USER, DB_NAME);
+    if (state->postgres == NULL) {
+        app_log(memory, "app: permanent memory is too small");
+        return 0;
+    }
+
+    return 1;
 }
 
 ARK_APP_UPDATE(ark_app_update) {
     AppState *state = (AppState *)memory->permanent;
+    Tick tick;
     size_t i;
 
     if (!memory->is_initialized) {
-        ark_memory_init(&state->permanent,
-                        (unsigned char *)memory->permanent + sizeof(AppState),
-                        memory->permanent_size - sizeof(AppState));
-        ark_memory_init(&state->transient, memory->transient, memory->transient_size);
-
-        state->connections = (Connection *)ark_memory_push(&state->permanent,
-                                                           sizeof(Connection) * ARK_MAX_CONNECTIONS);
-        if (state->connections == NULL) {
-            app_log(memory, "app: permanent memory is too small");
+        if (!init(state, memory)) {
             return;
         }
-
         memory->is_initialized = 1;
     }
 
     ark_memory_reset(&state->transient, state->transient.start);
 
+    tick.state = state;
+    tick.memory = memory;
+    tick.http.output = output;
+    tick.http.scratch = &state->transient;
+    tick.http.platform = &memory->platform;
+    tick.http.now_ms = input->now_ms;
+    tick.pg.output = output;
+    tick.pg.scratch = &state->transient;
+    tick.pg.upstreams = &state->upstreams;
+    tick.pg.now_ms = input->now_ms;
+
     for (i = 0; i < input->event_count; ++i) {
         const ArkEvent *event = &input->events[i];
-        Connection *conn = &state->connections[event->conn_id];
 
-        switch (event->type) {
-        case ARK_EVENT_OPEN:
-            conn->is_open = 1;
-            conn->closing = 0;
-            conn->request_length = 0;
-            conn->last_active_ms = input->now_ms;
-            break;
+        if (event->conn_id < ARK_MAX_CONNECTIONS) {
+            ark_http_handle_event(state->http, &tick.http, event, handle_request, &tick);
+            continue;
+        }
 
-        case ARK_EVENT_CLOSE:
-            conn->is_open = 0;
-            conn->closing = 0;
-            conn->request_length = 0;
-            break;
+        /* Outbound: pass it to whichever client owns the id. */
+        if (ark_upstream_owner(&state->upstreams, event->conn_id) == OWNER_POSTGRES) {
+            ark_pg_handle_event(state->postgres, &tick.pg, event);
+            handle_query_results(&tick);
+        }
 
-        case ARK_EVENT_DATA:
-            if (conn->is_open && !conn->closing) {
-                receive(state, memory, output, event, conn, input->now_ms);
-            }
-            break;
+        if (event->type == ARK_EVENT_CLOSE) {
+            ark_upstream_release(&state->upstreams, event->conn_id);
         }
     }
 
-    check_timeouts(state, memory, output, input->now_ms);
+    ark_http_update(state->http, &tick.http);
+
+    if (state->postgres != NULL) {
+        ark_pg_update(state->postgres, &tick.pg);
+    }
+    handle_query_results(&tick);
 }

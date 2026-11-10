@@ -1,0 +1,22 @@
+# Local development database. Start it with: docker compose up -d
+#
+# Ark -> PgBouncer (no password) -> Postgres (password). Postgres has no
+# published port, so only PgBouncer can reach it. The password here and in
+# pgbouncer/userlist.txt is for development only.
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ark
+      POSTGRES_DB: ark
+      POSTGRES_PASSWORD: ark_dev_password
+
+  pgbouncer:
+    build: ./pgbouncer
+    depends_on:
+      - postgres
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "127.0.0.1:6432:6432"

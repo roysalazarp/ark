@@ -9,9 +9,11 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -41,8 +43,11 @@
 #define TICK_TIMEOUT_MS 1000
 
 #define DEFAULT_PORT 8080
+#define DEFAULT_ENDPOINTS "db=127.0.0.1:6432"
+#define ENDPOINTS_SPEC_SIZE 4096
 #define LISTEN_BACKLOG 128
-#define LISTEN_ID ARK_MAX_CONNECTIONS
+#define MAX_SLOTS (ARK_MAX_CONNECTIONS + ARK_MAX_UPSTREAMS)
+#define LISTEN_ID MAX_SLOTS
 
 #define PATH_SIZE 4096
 #define APP_FILE_NAME "ArkSDK/lib/libark.so"
@@ -51,6 +56,7 @@
 typedef enum {
     SLOT_FREE,
     SLOT_OPEN,
+    SLOT_CONNECTING, /* outbound connect still in progress */
     SLOT_CLOSED,   /* socket closed, app not told yet */
     SLOT_NOTIFIED  /* app got the CLOSE event this tick */
 } SlotState;
@@ -77,7 +83,7 @@ typedef struct {
 
 static volatile sig_atomic_t g_running = 1;
 static int g_epoll_fd = -1;
-static Slot g_slots[ARK_MAX_CONNECTIONS];
+static Slot g_slots[MAX_SLOTS];
 
 static void linux_log(const char *message, size_t length) {
     fwrite(message, 1, length, stderr);
@@ -292,7 +298,7 @@ static int linux_listen(unsigned short port) {
 }
 
 static void linux_close_slot(Slot *slot) {
-    if (slot->state != SLOT_OPEN) {
+    if (slot->state != SLOT_OPEN && slot->state != SLOT_CONNECTING) {
         return;
     }
 
@@ -357,11 +363,16 @@ static void linux_flush_slot(Slot *slot) {
 static void linux_queue_send(const ArkSend *item) {
     Slot *slot;
 
-    if (item->conn_id >= ARK_MAX_CONNECTIONS) {
+    if (item->conn_id >= MAX_SLOTS) {
         return;
     }
 
     slot = &g_slots[item->conn_id];
+    if (slot->state == SLOT_CONNECTING && item->close_after) {
+        linux_close_slot(slot);
+        return;
+    }
+
     if (slot->state != SLOT_OPEN) {
         return;
     }
@@ -469,7 +480,7 @@ static void linux_read(Slot *slot, unsigned char *read_buffer, size_t *read_used
 static int linux_report_closes(ArkEvent *events, size_t *event_count) {
     unsigned long id;
 
-    for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
+    for (id = 0; id < MAX_SLOTS; ++id) {
         if (g_slots[id].state != SLOT_CLOSED) {
             continue;
         }
@@ -492,7 +503,7 @@ static int linux_report_closes(ArkEvent *events, size_t *event_count) {
 static int linux_has_unreported_closes(void) {
     unsigned long id;
 
-    for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
+    for (id = 0; id < MAX_SLOTS; ++id) {
         if (g_slots[id].state == SLOT_CLOSED) {
             return 1;
         }
@@ -501,11 +512,178 @@ static int linux_has_unreported_closes(void) {
     return 0;
 }
 
+/* ---- Outbound connections ---------------------------------------------- */
+
+static void linux_start_connect(const ArkConnect *item) {
+    struct sockaddr_in address;
+    struct epoll_event watch;
+    Slot *slot;
+    int fd;
+
+    if (item->conn_id < ARK_MAX_CONNECTIONS || item->conn_id >= MAX_SLOTS) {
+        return;
+    }
+
+    slot = &g_slots[item->conn_id];
+    if (slot->state != SLOT_FREE) {
+        fprintf(stderr, "platform: connection %lu is already in use\n", item->conn_id);
+        return;
+    }
+
+    slot->close_after_flush = 0;
+    slot->pending_start = 0;
+    slot->pending_length = 0;
+
+    /* Any failure from here is reported to the app as a CLOSE. */
+    slot->state = SLOT_CLOSED;
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(item->port);
+    if (inet_pton(AF_INET, item->host, &address.sin_addr) != 1) {
+        fprintf(stderr, "platform: invalid address %s\n", item->host);
+        return;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return;
+    }
+
+    memset(&watch, 0, sizeof(watch));
+    watch.events = EPOLLIN | EPOLLOUT;
+    watch.data.u64 = item->conn_id;
+
+    /* A non-blocking connect returns at once; epoll reports when it is done. */
+    if (!linux_set_nonblocking(fd) ||
+        (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0 && errno != EINPROGRESS) ||
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &watch) != 0) {
+        close(fd);
+        return;
+    }
+
+    slot->state = SLOT_CONNECTING;
+    slot->fd = fd;
+    slot->want_write = 1;
+}
+
+static void linux_finish_connect(Slot *slot, ArkEvent *events, size_t *event_count) {
+    socklen_t length = sizeof(int);
+    int error = 0;
+
+    /* epoll is level-triggered, so this is reported again next tick. */
+    if (*event_count >= MAX_EVENTS_PER_TICK) {
+        return;
+    }
+
+    if (getsockopt(slot->fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
+        linux_close_slot(slot);
+        return;
+    }
+
+    slot->state = SLOT_OPEN;
+
+    events[*event_count].type = ARK_EVENT_OPEN;
+    events[*event_count].conn_id = (unsigned long)(slot - g_slots);
+    events[*event_count].data = NULL;
+    events[*event_count].length = 0;
+    ++*event_count;
+
+    linux_watch_slot(slot, 0);
+}
+
+/* ---- Endpoints --------------------------------------------------------- */
+
+/*
+ * Parses "name=host:port,name=host:port". Host names are looked up here, once,
+ * so the app only ever sees IPv4 addresses. If an address changes later, the
+ * server needs a restart to see it.
+ */
+static int linux_load_endpoints(ArkConfig *config, const char *spec) {
+    char copy[ENDPOINTS_SPEC_SIZE];
+    char *entry;
+    char *next;
+
+    if (strlen(spec) >= sizeof(copy)) {
+        fprintf(stderr, "platform: ARK_ENDPOINTS is too long\n");
+        return 0;
+    }
+    memcpy(copy, spec, strlen(spec) + 1);
+
+    config->endpoint_count = 0;
+
+    if (spec[0] == '\0') {
+        return 1;
+    }
+
+    for (entry = copy; entry != NULL; entry = next) {
+        struct addrinfo hints;
+        struct addrinfo *found;
+        ArkEndpoint *endpoint;
+        char *equals;
+        char *colon;
+        int port;
+        size_t i;
+
+        next = strchr(entry, ',');
+        if (next != NULL) {
+            *next++ = '\0';
+        }
+
+        equals = strchr(entry, '=');
+        colon = strrchr(entry, ':');
+        if (equals == NULL || colon == NULL || colon < equals) {
+            fprintf(stderr, "platform: endpoint \"%s\" should look like name=host:port\n", entry);
+            return 0;
+        }
+        *equals = '\0';
+        *colon = '\0';
+
+        port = atoi(colon + 1);
+        if (equals == entry || strlen(entry) >= ARK_ENDPOINT_NAME_SIZE || port <= 0 || port > 65535) {
+            fprintf(stderr, "platform: endpoint \"%s\" has a bad name or port\n", entry);
+            return 0;
+        }
+
+        for (i = 0; i < config->endpoint_count; ++i) {
+            if (strcmp(config->endpoints[i].name, entry) == 0) {
+                fprintf(stderr, "platform: endpoint \"%s\" is listed twice\n", entry);
+                return 0;
+            }
+        }
+
+        if (config->endpoint_count >= ARK_MAX_ENDPOINTS) {
+            fprintf(stderr, "platform: too many endpoints\n");
+            return 0;
+        }
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(equals + 1, NULL, &hints, &found) != 0) {
+            fprintf(stderr, "platform: cannot find the address of %s\n", equals + 1);
+            return 0;
+        }
+
+        endpoint = &config->endpoints[config->endpoint_count++];
+        memcpy(endpoint->name, entry, strlen(entry) + 1);
+        endpoint->port = (unsigned short)port;
+        inet_ntop(AF_INET, &((struct sockaddr_in *)found->ai_addr)->sin_addr,
+                  endpoint->host, sizeof(endpoint->host));
+        freeaddrinfo(found);
+
+        fprintf(stderr, "platform: endpoint %s is %s:%d\n", endpoint->name, endpoint->host, port);
+    }
+
+    return 1;
+}
+
 /* ---- Main loop --------------------------------------------------------- */
 
 int main(int argc, char **argv) {
     static ArkEvent events[MAX_EVENTS_PER_TICK];
     static ArkSend sends[MAX_SENDS_PER_TICK];
+    static ArkConnect connects[ARK_MAX_UPSTREAMS];
     struct epoll_event epoll_events[MAX_EPOLL_EVENTS];
     struct epoll_event listen_watch;
     struct sigaction action;
@@ -515,6 +693,7 @@ int main(int argc, char **argv) {
     unsigned char *pending_buffers;
     unsigned char *app_storage;
     int port = DEFAULT_PORT;
+    const char *endpoints;
     int listen_fd;
     unsigned long id;
 
@@ -535,7 +714,7 @@ int main(int argc, char **argv) {
     /* All memory is reserved once, up front. */
     app_storage = (unsigned char *)linux_allocate(PERMANENT_MEMORY_SIZE + TRANSIENT_MEMORY_SIZE);
     read_buffer = (unsigned char *)linux_allocate(READ_BUFFER_SIZE);
-    pending_buffers = (unsigned char *)linux_allocate(PENDING_OUTPUT_SIZE * ARK_MAX_CONNECTIONS);
+    pending_buffers = (unsigned char *)linux_allocate(PENDING_OUTPUT_SIZE * MAX_SLOTS);
     if (app_storage == NULL || read_buffer == NULL || pending_buffers == NULL) {
         fprintf(stderr, "platform: cannot allocate memory\n");
         return 1;
@@ -548,7 +727,12 @@ int main(int argc, char **argv) {
     app_memory.transient_size = TRANSIENT_MEMORY_SIZE;
     app_memory.platform.log = linux_log;
 
-    for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
+    endpoints = getenv("ARK_ENDPOINTS");
+    if (!linux_load_endpoints(&app_memory.config, endpoints != NULL ? endpoints : DEFAULT_ENDPOINTS)) {
+        return 1;
+    }
+
+    for (id = 0; id < MAX_SLOTS; ++id) {
         g_slots[id].state = SLOT_FREE;
         g_slots[id].fd = -1;
         g_slots[id].pending = pending_buffers + id * PENDING_OUTPUT_SIZE;
@@ -610,6 +794,11 @@ int main(int argc, char **argv) {
             }
 
             slot = &g_slots[ready_id];
+            if (slot->state == SLOT_CONNECTING) {
+                linux_finish_connect(slot, events, &event_count);
+                continue;
+            }
+
             if (slot->state != SLOT_OPEN) {
                 continue;
             }
@@ -633,6 +822,9 @@ int main(int argc, char **argv) {
         output.sends = sends;
         output.send_count = 0;
         output.send_capacity = MAX_SENDS_PER_TICK;
+        output.connects = connects;
+        output.connect_count = 0;
+        output.connect_capacity = ARK_MAX_UPSTREAMS;
 
         app.update(&app_memory, &input, &output);
 
@@ -640,22 +832,26 @@ int main(int argc, char **argv) {
             linux_queue_send(&output.sends[i]);
         }
         for (i = 0; i < output.send_count; ++i) {
-            if (output.sends[i].conn_id < ARK_MAX_CONNECTIONS) {
+            if (output.sends[i].conn_id < MAX_SLOTS) {
                 linux_flush_slot(&g_slots[output.sends[i].conn_id]);
             }
         }
 
         /* Ids are only reused once the app has seen the CLOSE. */
-        for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
+        for (id = 0; id < MAX_SLOTS; ++id) {
             if (g_slots[id].state == SLOT_NOTIFIED) {
                 g_slots[id].state = SLOT_FREE;
             }
+        }
+
+        for (i = 0; i < output.connect_count; ++i) {
+            linux_start_connect(&output.connects[i]);
         }
     }
 
     fprintf(stderr, "platform: shutting down\n");
 
-    for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
+    for (id = 0; id < MAX_SLOTS; ++id) {
         linux_close_slot(&g_slots[id]);
     }
     close(listen_fd);
