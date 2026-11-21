@@ -2,17 +2,8 @@
 #include <ark/text.h>
 
 /*
- * Each query is a state machine moved along by events: connect, send the
- * startup message, send the query, then report the result. Each running query
- * uses its own outbound connection. When none is free, a query waits, and
- * waiting queries start in the order they were asked for. A query id is its
- * index in queries.
- *
  * Every message is a type byte, then a big-endian 32-bit length that counts
  * itself but not the type byte, then the body. The startup message has no type.
- *
- * Everything kept between ticks is copied into this module's memory. A pointer
- * to the caller's strings would dangle after the app is reloaded.
  */
 
 #define PG_NAME_SIZE 64
@@ -20,6 +11,299 @@
 /* Give up on a query that has not finished after this long. */
 #define PG_TIMEOUT_MS 15000
 #define PG_NULL_LENGTH 0xffffffffUL
+#define PG_PROTOCOL_VERSION 196608UL /* 3.0 */
+
+/* ---- Protocol tier ----------------------------------------------------- */
+
+static unsigned long pg_read_u16(const unsigned char *data) {
+    return ((unsigned long)data[0] << 8) | (unsigned long)data[1];
+}
+
+static unsigned long pg_read_u32(const unsigned char *data) {
+    return ((unsigned long)data[0] << 24) | ((unsigned long)data[1] << 16) |
+           ((unsigned long)data[2] << 8) | (unsigned long)data[3];
+}
+
+static void pg_put_u16(ArkBuffer *buffer, unsigned long value) {
+    unsigned char bytes[2];
+
+    bytes[0] = (unsigned char)((value >> 8) & 0xff);
+    bytes[1] = (unsigned char)(value & 0xff);
+    ark_buffer_append(buffer, bytes, 2);
+}
+
+static void pg_put_u32(ArkBuffer *buffer, unsigned long value) {
+    unsigned char bytes[4];
+
+    bytes[0] = (unsigned char)((value >> 24) & 0xff);
+    bytes[1] = (unsigned char)((value >> 16) & 0xff);
+    bytes[2] = (unsigned char)((value >> 8) & 0xff);
+    bytes[3] = (unsigned char)(value & 0xff);
+    ark_buffer_append(buffer, bytes, 4);
+}
+
+static void pg_put_cstr(ArkBuffer *buffer, const char *s) {
+    ark_buffer_append(buffer, s, ark_cstr_length(s) + 1);
+}
+
+/* Writes the type and a length to fill in later. Returns where the length is. */
+static size_t pg_begin_message(ArkBuffer *buffer, char type) {
+    size_t length_at;
+
+    ark_buffer_append(buffer, &type, 1);
+    length_at = buffer->length;
+    pg_put_u32(buffer, 0);
+
+    return length_at;
+}
+
+static void pg_end_message(ArkBuffer *buffer, size_t length_at) {
+    unsigned long length = (unsigned long)(buffer->length - length_at);
+
+    if (!buffer->overflowed) {
+        buffer->data[length_at] = (unsigned char)((length >> 24) & 0xff);
+        buffer->data[length_at + 1] = (unsigned char)((length >> 16) & 0xff);
+        buffer->data[length_at + 2] = (unsigned char)((length >> 8) & 0xff);
+        buffer->data[length_at + 3] = (unsigned char)(length & 0xff);
+    }
+}
+
+int ark_pg_write_startup(ArkBuffer *buffer, const char *user, const char *database) {
+    /* No type byte: the length comes first, then the version and name/value pairs. */
+    size_t length_at = buffer->length;
+
+    pg_put_u32(buffer, 0);
+    pg_put_u32(buffer, PG_PROTOCOL_VERSION);
+    pg_put_cstr(buffer, "user");
+    pg_put_cstr(buffer, user);
+    pg_put_cstr(buffer, "database");
+    pg_put_cstr(buffer, database);
+    pg_put_cstr(buffer, "");
+    pg_end_message(buffer, length_at);
+
+    return !buffer->overflowed;
+}
+
+/*
+ * The extended query messages: Parse sends the sql, Bind sends the values,
+ * Describe asks for the column count, Execute runs it and Sync ends it. Empty
+ * names mean the unnamed statement.
+ */
+int ark_pg_write_query(ArkBuffer *buffer, const char *sql, const ArkBytes *params, size_t param_count) {
+    size_t length_at;
+    size_t i;
+
+    length_at = pg_begin_message(buffer, 'P');
+    pg_put_cstr(buffer, "");
+    pg_put_cstr(buffer, sql);
+    pg_put_u16(buffer, 0);
+    pg_end_message(buffer, length_at);
+
+    length_at = pg_begin_message(buffer, 'B');
+    pg_put_cstr(buffer, "");
+    pg_put_cstr(buffer, "");
+    pg_put_u16(buffer, 0);
+    pg_put_u16(buffer, (unsigned long)param_count);
+    for (i = 0; i < param_count; ++i) {
+        if (params[i].data == NULL) {
+            pg_put_u32(buffer, PG_NULL_LENGTH);
+        } else {
+            pg_put_u32(buffer, (unsigned long)params[i].length);
+            ark_buffer_append(buffer, params[i].data, params[i].length);
+        }
+    }
+    pg_put_u16(buffer, 0);
+    pg_end_message(buffer, length_at);
+
+    length_at = pg_begin_message(buffer, 'D');
+    ark_buffer_append(buffer, "P", 1);
+    pg_put_cstr(buffer, "");
+    pg_end_message(buffer, length_at);
+
+    length_at = pg_begin_message(buffer, 'E');
+    pg_put_cstr(buffer, "");
+    pg_put_u32(buffer, 0);
+    pg_end_message(buffer, length_at);
+
+    length_at = pg_begin_message(buffer, 'S');
+    pg_end_message(buffer, length_at);
+
+    return !buffer->overflowed;
+}
+
+int ark_pg_write_terminate(ArkBuffer *buffer) {
+    pg_end_message(buffer, pg_begin_message(buffer, 'X'));
+    return !buffer->overflowed;
+}
+
+long ark_pg_read_message(ArkBytes data, ArkPgMessage *message) {
+    unsigned long length;
+
+    if (data.length < 5) {
+        return 0;
+    }
+
+    length = pg_read_u32(data.data + 1);
+    if (length < 4) {
+        return -1;
+    }
+
+    if (data.length - 1 < length) {
+        return 0;
+    }
+
+    message->type = data.data[0];
+    message->body.data = data.data + 5;
+    message->body.length = (size_t)length - 4;
+
+    return (long)length + 1;
+}
+
+int ark_pg_auth_ok(ArkBytes body) {
+    /* 0 means no password is needed. */
+    return body.length >= 4 && pg_read_u32(body.data) == 0;
+}
+
+int ark_pg_read_column_count(ArkBytes body, size_t *count) {
+    if (body.length < 2) {
+        return 0;
+    }
+
+    *count = (size_t)pg_read_u16(body.data);
+    return 1;
+}
+
+/* A row is a 16-bit column count, then each value as a 32-bit length (all ones for NULL) and its bytes. */
+int ark_pg_check_row(ArkBytes body, size_t *column_count) {
+    size_t columns;
+    size_t offset = 2;
+    size_t i;
+
+    if (!ark_pg_read_column_count(body, &columns)) {
+        return 0;
+    }
+
+    for (i = 0; i < columns; ++i) {
+        unsigned long length;
+
+        if (body.length - offset < 4) {
+            return 0;
+        }
+
+        length = pg_read_u32(body.data + offset);
+        offset += 4;
+
+        if (length != PG_NULL_LENGTH) {
+            if (length > body.length - offset) {
+                return 0;
+            }
+            offset += (size_t)length;
+        }
+    }
+
+    if (offset != body.length) {
+        return 0;
+    }
+
+    *column_count = columns;
+    return 1;
+}
+
+int ark_pg_read_row_value(ArkBytes body, size_t column, ArkBytes *value) {
+    size_t columns;
+    size_t offset = 2;
+    size_t i;
+
+    if (!ark_pg_read_column_count(body, &columns) || column >= columns) {
+        return 0;
+    }
+
+    for (i = 0; i <= column; ++i) {
+        unsigned long length;
+
+        if (body.length - offset < 4) {
+            return 0;
+        }
+
+        length = pg_read_u32(body.data + offset);
+        offset += 4;
+
+        if (length != PG_NULL_LENGTH && length > body.length - offset) {
+            return 0;
+        }
+
+        if (i == column) {
+            value->data = length == PG_NULL_LENGTH ? NULL : body.data + offset;
+            value->length = length == PG_NULL_LENGTH ? 0 : (size_t)length;
+            return 1;
+        }
+
+        if (length != PG_NULL_LENGTH) {
+            offset += (size_t)length;
+        }
+    }
+
+    return 0;
+}
+
+/* The command tag is like "UPDATE 3" or "INSERT 0 3": the count is the last word. */
+unsigned long ark_pg_read_command_count(ArkBytes body) {
+    size_t end = 0;
+    size_t start;
+    unsigned long count = 0;
+
+    while (end < body.length && body.data[end] != '\0') {
+        ++end;
+    }
+
+    start = end;
+    while (start > 0 && body.data[start - 1] >= '0' && body.data[start - 1] <= '9') {
+        --start;
+    }
+
+    if (start == end || start == 0 || body.data[start - 1] != ' ') {
+        return 0;
+    }
+
+    for (; start < end; ++start) {
+        count = count * 10 + (unsigned long)(body.data[start] - '0');
+    }
+
+    return count;
+}
+
+/* Fields of a type byte and a null-terminated string. 'C' is the code, 'M' the message. */
+int ark_pg_read_error(ArkBytes body, ArkBytes *code, ArkBytes *message) {
+    size_t i = 0;
+
+    code->data = NULL;
+    code->length = 0;
+    message->data = NULL;
+    message->length = 0;
+
+    while (i < body.length && body.data[i] != '\0') {
+        size_t start = i + 1;
+        size_t end = start;
+
+        while (end < body.length && body.data[end] != '\0') {
+            ++end;
+        }
+
+        if (body.data[i] == 'M') {
+            message->data = body.data + start;
+            message->length = end - start;
+        } else if (body.data[i] == 'C') {
+            code->data = body.data + start;
+            code->length = end - start;
+        }
+
+        i = end + 1;
+    }
+
+    return 1;
+}
+
+/* ---- Query tier: state ------------------------------------------------- */
 
 typedef enum {
     PG_FREE,
@@ -37,9 +321,6 @@ typedef enum {
  * listed backwards from the end:
  *
  *   [row 0][row 1]...[bytes being read]...free...[start of row 1][start of row 0]
- *
- * A row is kept as Postgres sends it: a 16-bit column count, then each value as
- * a 32-bit length (all ones for NULL) and its bytes.
  */
 typedef struct {
     int in_use;
@@ -85,15 +366,6 @@ struct ArkPostgres {
     size_t finished_count;
 };
 
-static unsigned long pg_read_u16(const unsigned char *data) {
-    return ((unsigned long)data[0] << 8) | (unsigned long)data[1];
-}
-
-static unsigned long pg_read_u32(const unsigned char *data) {
-    return ((unsigned long)data[0] << 24) | ((unsigned long)data[1] << 16) |
-           ((unsigned long)data[2] << 8) | (unsigned long)data[3];
-}
-
 static int pg_is_active(const PgQuery *query) {
     return query->state == PG_CONNECTING || query->state == PG_STARTING || query->state == PG_QUERYING;
 }
@@ -119,52 +391,10 @@ static size_t pg_free_bytes(const PgQuery *query) {
     return ARK_PG_RESULT_SIZE - query->rows_end - query->pending_length - query->row_count * sizeof(size_t);
 }
 
-/* ---- Message fields ---------------------------------------------------- */
+/* ---- Query tier: sending ----------------------------------------------- */
 
-static void pg_put_u16(ArkBuffer *writer, unsigned long value) {
-    unsigned char bytes[2];
-
-    bytes[0] = (unsigned char)((value >> 8) & 0xff);
-    bytes[1] = (unsigned char)(value & 0xff);
-    ark_buffer_append(writer, bytes, 2);
-}
-
-static void pg_put_u32(ArkBuffer *writer, unsigned long value) {
-    unsigned char bytes[4];
-
-    bytes[0] = (unsigned char)((value >> 24) & 0xff);
-    bytes[1] = (unsigned char)((value >> 16) & 0xff);
-    bytes[2] = (unsigned char)((value >> 8) & 0xff);
-    bytes[3] = (unsigned char)(value & 0xff);
-    ark_buffer_append(writer, bytes, 4);
-}
-
-/* Writes the type and a length to fill in later. Returns where the length is. */
-static size_t pg_begin_message(ArkBuffer *writer, char type) {
-    size_t length_at;
-
-    ark_buffer_append(writer, &type, 1);
-    length_at = writer->length;
-    pg_put_u32(writer, 0);
-
-    return length_at;
-}
-
-static void pg_end_message(ArkBuffer *writer, size_t length_at) {
-    unsigned long length = (unsigned long)(writer->length - length_at);
-
-    if (!writer->overflowed) {
-        writer->data[length_at] = (unsigned char)((length >> 24) & 0xff);
-        writer->data[length_at + 1] = (unsigned char)((length >> 16) & 0xff);
-        writer->data[length_at + 2] = (unsigned char)((length >> 8) & 0xff);
-        writer->data[length_at + 3] = (unsigned char)(length & 0xff);
-    }
-}
-
-/* ---- Sending ----------------------------------------------------------- */
-
-static int pg_queue(const ArkPgContext *context, const PgQuery *query,
-                    const unsigned char *data, size_t length, int close_after) {
+static int pg_queue(const ArkPgContext *context, const PgQuery *query, const unsigned char *data, size_t length,
+                    int close_after) {
     ArkOutput *output = context->output;
     ArkSend *send;
 
@@ -174,34 +404,17 @@ static int pg_queue(const ArkPgContext *context, const PgQuery *query,
 
     send = &output->sends[output->send_count++];
     send->conn_id = query->conn_id;
-    send->data = data;
-    send->length = length;
+    send->bytes.data = data;
+    send->bytes.length = length;
     send->close_after = close_after;
 
     return 1;
 }
 
-static int pg_send(const ArkPgContext *context, const PgQuery *query,
-                   char type, const void *body, size_t body_length, int close_after) {
-    ArkBuffer message;
-
-    if (!ark_buffer_push(&message, context->scratch, body_length + 5)) {
-        return 0;
-    }
-
-    if (type != '\0') {
-        ark_buffer_append(&message, &type, 1);
-    }
-    pg_put_u32(&message, (unsigned long)body_length + 4);
-    ark_buffer_append(&message, body, body_length);
-
-    return pg_queue(context, query, message.data, message.length, close_after);
-}
-
-/* ---- Finishing --------------------------------------------------------- */
-
 /* The message must already be set. */
 static void pg_finish(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query, ArkPgStatus status) {
+    ArkBuffer terminate;
+
     query->status = status;
     query->elapsed_ms = context->now_ms - query->started_ms;
 
@@ -214,7 +427,10 @@ static void pg_finish(ArkPostgres *pg, const ArkPgContext *context, PgQuery *que
     }
 
     query->state = PG_CLOSING;
-    pg_send(context, query, 'X', NULL, 0, 1);
+
+    if (ark_buffer_push(&terminate, context->scratch, 5) && ark_pg_write_terminate(&terminate)) {
+        pg_queue(context, query, terminate.data, terminate.length, 1);
+    }
 }
 
 static void pg_fail(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query,
@@ -223,102 +439,79 @@ static void pg_fail(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query
     pg_finish(pg, context, query, status);
 }
 
-/* ---- Receiving --------------------------------------------------------- */
-
 static void pg_send_startup(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query) {
-    /* Protocol version 3.0, then name/value pairs, then an empty name. */
-    static const char version[] = "\0\3\0\0user";
-    static const char database[] = "database";
-    char body[sizeof(version) + sizeof(database) + PG_NAME_SIZE * 2 + 1];
-    size_t user_length = ark_cstr_length(pg->user);
-    size_t database_length = ark_cstr_length(pg->database);
-    size_t length = 0;
-
-    ark_memory_copy(body, version, sizeof(version));
-    length += sizeof(version);
-    ark_memory_copy(body + length, pg->user, user_length + 1);
-    length += user_length + 1;
-    ark_memory_copy(body + length, database, sizeof(database));
-    length += sizeof(database);
-    ark_memory_copy(body + length, pg->database, database_length + 1);
-    length += database_length + 1;
-    body[length++] = '\0';
+    ArkBuffer startup;
 
     query->state = PG_STARTING;
 
-    if (!pg_send(context, query, '\0', body, length, 0)) {
+    if (!ark_buffer_push(&startup, context->scratch, PG_NAME_SIZE * 2 + 32) ||
+        !ark_pg_write_startup(&startup, pg->user, pg->database) ||
+        !pg_queue(context, query, startup.data, startup.length, 0)) {
         pg_fail(pg, context, query, ARK_PG_ERROR, "could not send");
     }
 }
 
-static void pg_handle_error(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query,
-                            const unsigned char *body, size_t length) {
-    size_t i = 0;
+/* ---- Query tier: receiving --------------------------------------------- */
 
-    pg_set_message(query, "unknown error", 13);
+static void pg_handle_error(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query, ArkBytes body) {
+    ArkBytes code;
+    ArkBytes message;
 
-    /* Fields of a type byte and a null-terminated string. 'C' is the code, 'M' the message. */
-    while (i < length && body[i] != '\0') {
-        size_t start = i + 1;
-        size_t end = start;
+    ark_pg_read_error(body, &code, &message);
 
-        while (end < length && body[end] != '\0') {
-            ++end;
-        }
+    if (message.data != NULL) {
+        pg_set_message(query, message.data, message.length);
+    } else {
+        pg_set_message(query, "unknown error", 13);
+    }
 
-        if (body[i] == 'M') {
-            pg_set_message(query, body + start, end - start);
-        } else if (body[i] == 'C' && end - start == 5) {
-            ark_memory_copy(query->error_code, body + start, 5);
-            query->error_code[5] = '\0';
-        }
-
-        i = end + 1;
+    if (code.length == 5) {
+        ark_memory_copy(query->error_code, code.data, 5);
+        query->error_code[5] = '\0';
     }
 
     pg_finish(pg, context, query, ARK_PG_ERROR);
 }
 
-/* The command tag is like "UPDATE 3" or "INSERT 0 3": the count is the last word. */
-static void pg_read_command_tag(PgQuery *query, const unsigned char *body, size_t length) {
-    size_t end = 0;
-    size_t start;
-    unsigned long count = 0;
+/*
+ * Checks a data row, then keeps it: the body moves down over its own 5 header
+ * bytes to sit right after the rows already stored.
+ */
+static void pg_store_row(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query, ArkBytes body) {
+    size_t columns;
 
-    while (end < length && body[end] != '\0') {
-        ++end;
-    }
-
-    start = end;
-    while (start > 0 && body[start - 1] >= '0' && body[start - 1] <= '9') {
-        --start;
-    }
-
-    if (start == end || start == 0 || body[start - 1] != ' ') {
+    if (!ark_pg_check_row(body, &columns) || (query->has_column_count && columns != query->column_count)) {
+        pg_fail(pg, context, query, ARK_PG_ERROR, "bad row");
         return;
     }
 
-    for (; start < end; ++start) {
-        count = count * 10 + (unsigned long)(body[start] - '0');
+    /* Keeping it frees 5 header bytes but takes one more row start. */
+    if (pg_free_bytes(query) + 5 < sizeof(size_t)) {
+        pg_fail(pg, context, query, ARK_PG_ERROR, "result too large");
+        return;
     }
 
-    query->rows_affected = count;
+    /* dest < src, so a forward copy is safe. */
+    ark_memory_copy(query->space->data + query->rows_end, body.data, body.length);
+    pg_row_starts_end(query)[-1 - (long)query->row_count] = query->rows_end;
+
+    query->rows_end += body.length;
+    query->row_count += 1;
+    query->column_count = columns;
+    query->has_column_count = 1;
 }
 
 static void pg_handle_message(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query,
-                              unsigned char type, const unsigned char *body, size_t length) {
-    switch (type) {
+                              const ArkPgMessage *message) {
+    switch (message->type) {
     case 'R':
-        /* 0 means no password is needed. Any other request can't be answered yet. */
-        if (length < 4 || pg_read_u32(body) != 0) {
+        if (!ark_pg_auth_ok(message->body)) {
             pg_fail(pg, context, query, ARK_PG_ERROR, "server wants a password");
         }
         break;
 
     case 'T':
-        /* Row description: starts with the column count. */
-        if (length >= 2) {
-            query->column_count = pg_read_u16(body);
+        if (ark_pg_read_column_count(message->body, &query->column_count)) {
             query->has_column_count = 1;
         }
         break;
@@ -329,12 +522,16 @@ static void pg_handle_message(ArkPostgres *pg, const ArkPgContext *context, PgQu
         query->has_column_count = 1;
         break;
 
+    case 'D':
+        pg_store_row(pg, context, query, message->body);
+        break;
+
     case 'C':
-        pg_read_command_tag(query, body, length);
+        query->rows_affected = ark_pg_read_command_count(message->body);
         break;
 
     case 'E':
-        pg_handle_error(pg, context, query, body, length);
+        pg_handle_error(pg, context, query, message->body);
         break;
 
     case 'Z':
@@ -355,107 +552,45 @@ static void pg_handle_message(ArkPostgres *pg, const ArkPgContext *context, PgQu
     }
 }
 
-/*
- * Checks a data row, then keeps it: the body moves down over its own 5 header
- * bytes to sit right after the rows already stored.
- */
-static void pg_store_row(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query,
-                         unsigned char *body, size_t length) {
-    unsigned long columns;
-    size_t offset = 2;
-    unsigned long i;
-
-    if (length < 2) {
-        pg_fail(pg, context, query, ARK_PG_ERROR, "bad row");
-        return;
-    }
-
-    columns = pg_read_u16(body);
-    if (query->has_column_count && columns != query->column_count) {
-        pg_fail(pg, context, query, ARK_PG_ERROR, "bad row");
-        return;
-    }
-
-    for (i = 0; i < columns; ++i) {
-        unsigned long value_length;
-
-        if (length - offset < 4) {
-            pg_fail(pg, context, query, ARK_PG_ERROR, "bad row");
-            return;
-        }
-
-        value_length = pg_read_u32(body + offset);
-        offset += 4;
-
-        if (value_length != PG_NULL_LENGTH) {
-            if (value_length > length - offset) {
-                pg_fail(pg, context, query, ARK_PG_ERROR, "bad row");
-                return;
-            }
-            offset += value_length;
-        }
-    }
-
-    if (offset != length) {
-        pg_fail(pg, context, query, ARK_PG_ERROR, "bad row");
-        return;
-    }
-
-    /* Keeping it frees 5 header bytes but takes one more row start. */
-    if (pg_free_bytes(query) + 5 < sizeof(size_t)) {
-        pg_fail(pg, context, query, ARK_PG_ERROR, "result too large");
-        return;
-    }
-
-    /* dest < src, so a forward copy is safe. */
-    ark_memory_copy(query->space->data + query->rows_end, body, length);
-    pg_row_starts_end(query)[-1 - (long)query->row_count] = query->rows_end;
-
-    query->rows_end += length;
-    query->row_count += 1;
-    query->column_count = columns;
-    query->has_column_count = 1;
-}
-
 static void pg_process_messages(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query) {
-    while (pg_is_active(query) && query->pending_length >= 5) {
+    while (pg_is_active(query)) {
         size_t start = query->rows_end;
-        unsigned char *message = query->space->data + start;
-        unsigned long length = pg_read_u32(message + 1);
-        size_t consumed;
+        ArkBytes pending;
+        ArkPgMessage message;
+        long consumed;
 
-        if (length < 4) {
-            pg_fail(pg, context, query, ARK_PG_ERROR, "bad message length");
-            return;
-        }
+        pending.data = query->space->data + start;
+        pending.length = query->pending_length;
 
-        if (length + 1 > ARK_PG_RESULT_SIZE) {
+        /* A message that could never fit fails now, rather than filling the space first. */
+        if (pending.length >= 5 && pg_read_u32(pending.data + 1) + 1 > ARK_PG_RESULT_SIZE) {
             pg_fail(pg, context, query, ARK_PG_ERROR, "result too large");
             return;
         }
 
-        if (query->pending_length < length + 1) {
+        consumed = ark_pg_read_message(pending, &message);
+        if (consumed == 0) {
             return;
         }
 
-        consumed = (size_t)length + 1;
-
-        if (message[0] == 'D') {
-            pg_store_row(pg, context, query, message + 5, consumed - 5);
-        } else {
-            pg_handle_message(pg, context, query, message[0], message + 5, consumed - 5);
+        if (consumed < 0) {
+            pg_fail(pg, context, query, ARK_PG_ERROR, "bad message length");
+            return;
         }
 
+        /* A stored row moves rows_end on, so this reads where the rest now goes. */
+        pg_handle_message(pg, context, query, &message);
+
         /* Move the bytes after this message up to the end of the rows. */
-        query->pending_length -= consumed;
+        query->pending_length -= (size_t)consumed;
         ark_memory_copy(query->space->data + query->rows_end, query->space->data + start + consumed,
                         query->pending_length);
     }
 }
 
 static void pg_receive(ArkPostgres *pg, const ArkPgContext *context, PgQuery *query, const ArkEvent *event) {
-    const unsigned char *data = event->data;
-    size_t remaining = event->length;
+    const unsigned char *data = event->bytes.data;
+    size_t remaining = event->bytes.length;
 
     while (remaining > 0 && pg_is_active(query)) {
         size_t take = pg_free_bytes(query);
@@ -478,54 +613,7 @@ static void pg_receive(ArkPostgres *pg, const ArkPgContext *context, PgQuery *qu
     }
 }
 
-/* ---- Writing queries --------------------------------------------------- */
-
-/*
- * The extended query messages: Parse sends the sql, Bind sends the values,
- * Describe asks for the column count, Execute runs it and Sync ends it. Empty
- * names mean the unnamed statement.
- */
-static void pg_write_query(ArkBuffer *writer, const char *sql, const ArkPgValue *params, size_t param_count) {
-    size_t length_at;
-    size_t i;
-
-    length_at = pg_begin_message(writer, 'P');
-    ark_buffer_append(writer, "", 1);
-    ark_buffer_append(writer, sql, ark_cstr_length(sql) + 1);
-    pg_put_u16(writer, 0);
-    pg_end_message(writer, length_at);
-
-    length_at = pg_begin_message(writer, 'B');
-    ark_buffer_append(writer, "", 1);
-    ark_buffer_append(writer, "", 1);
-    pg_put_u16(writer, 0);
-    pg_put_u16(writer, (unsigned long)param_count);
-    for (i = 0; i < param_count; ++i) {
-        if (params[i].data == NULL) {
-            pg_put_u32(writer, PG_NULL_LENGTH);
-        } else {
-            pg_put_u32(writer, (unsigned long)params[i].length);
-            ark_buffer_append(writer, params[i].data, params[i].length);
-        }
-    }
-    pg_put_u16(writer, 0);
-    pg_end_message(writer, length_at);
-
-    length_at = pg_begin_message(writer, 'D');
-    ark_buffer_append(writer, "P", 1);
-    ark_buffer_append(writer, "", 1);
-    pg_end_message(writer, length_at);
-
-    length_at = pg_begin_message(writer, 'E');
-    ark_buffer_append(writer, "", 1);
-    pg_put_u32(writer, 0);
-    pg_end_message(writer, length_at);
-
-    length_at = pg_begin_message(writer, 'S');
-    pg_end_message(writer, length_at);
-}
-
-/* ---- Queue ------------------------------------------------------------- */
+/* ---- Query tier: queue ------------------------------------------------- */
 
 static PgSpace *pg_take_space(ArkPostgres *pg) {
     size_t i;
@@ -583,7 +671,7 @@ static void pg_start_waiting(ArkPostgres *pg, const ArkPgContext *context) {
     }
 }
 
-/* ---- Interface --------------------------------------------------------- */
+/* ---- Query tier: interface --------------------------------------------- */
 
 ArkPostgres *ark_pg_create(Memory *permanent, const ArkEndpoint *endpoint, int owner, size_t max_connections,
                            const char *user, const char *database) {
@@ -623,19 +711,17 @@ ArkPostgres *ark_pg_create(Memory *permanent, const ArkEndpoint *endpoint, int o
 }
 
 ArkPgStart ark_pg_start(ArkPostgres *pg, const ArkPgContext *context, const char *sql,
-                        const ArkPgValue *params, size_t param_count, unsigned long *query_id) {
+                        const ArkBytes *params, size_t param_count, unsigned long *query_id) {
     size_t i;
 
     for (i = 0; i < ARK_PG_MAX_QUERIES; ++i) {
         PgQuery *query = &pg->queries[i];
 
         if (query->state == PG_FREE) {
-            ArkBuffer writer;
+            ArkBuffer request;
 
-            ark_buffer_init(&writer, query->request, PG_REQUEST_SIZE);
-
-            pg_write_query(&writer, sql, params, param_count);
-            if (writer.overflowed) {
+            ark_buffer_init(&request, query->request, PG_REQUEST_SIZE);
+            if (!ark_pg_write_query(&request, sql, params, param_count)) {
                 return ARK_PG_TOO_LARGE;
             }
 
@@ -643,7 +729,7 @@ ArkPgStart ark_pg_start(ArkPostgres *pg, const ArkPgContext *context, const char
             query->state = PG_WAITING;
             query->order = pg->next_order++;
             query->started_ms = context->now_ms;
-            query->request_length = writer.length;
+            query->request_length = request.length;
             query->space = NULL;
             query->message[0] = '\0';
             query->error_code[0] = '\0';
@@ -723,6 +809,7 @@ int ark_pg_next_result(ArkPostgres *pg, ArkPgResult *result) {
     result->row_count = 0;
     result->column_count = 0;
     result->rows = NULL;
+    result->rows_length = 0;
     result->row_starts_end = NULL;
 
     if (query->status == ARK_PG_OK) {
@@ -730,6 +817,7 @@ int ark_pg_next_result(ArkPostgres *pg, ArkPgResult *result) {
         result->row_count = query->row_count;
         result->column_count = query->column_count;
         result->rows = query->space->data;
+        result->rows_length = query->rows_end;
         result->row_starts_end = pg_row_starts_end(query);
     }
 
@@ -749,31 +837,25 @@ int ark_pg_next_result(ArkPostgres *pg, ArkPgResult *result) {
     return 1;
 }
 
-int ark_pg_value(const ArkPgResult *result, size_t row, size_t column, ArkPgValue *value) {
-    const unsigned char *data;
-    size_t offset = 2;
-    size_t i;
+int ark_pg_row(const ArkPgResult *result, size_t row, ArkBytes *body) {
+    size_t start;
+    size_t end;
 
-    if (row >= result->row_count || column >= result->column_count) {
+    if (row >= result->row_count) {
         return 0;
     }
 
-    /* Rows were checked when they were stored, so this walk stays inside them. */
-    data = result->rows + result->row_starts_end[-1 - (long)row];
+    start = result->row_starts_end[-1 - (long)row];
+    end = row + 1 < result->row_count ? result->row_starts_end[-2 - (long)row] : result->rows_length;
 
-    for (i = 0;; ++i) {
-        unsigned long length = pg_read_u32(data + offset);
+    body->data = result->rows + start;
+    body->length = end - start;
 
-        offset += 4;
+    return 1;
+}
 
-        if (i == column) {
-            value->data = length == PG_NULL_LENGTH ? NULL : data + offset;
-            value->length = length == PG_NULL_LENGTH ? 0 : (size_t)length;
-            return 1;
-        }
+int ark_pg_value(const ArkPgResult *result, size_t row, size_t column, ArkBytes *value) {
+    ArkBytes body;
 
-        if (length != PG_NULL_LENGTH) {
-            offset += length;
-        }
-    }
+    return ark_pg_row(result, row, &body) && ark_pg_read_row_value(body, column, value);
 }

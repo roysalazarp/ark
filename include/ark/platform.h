@@ -14,6 +14,8 @@
 
 #include <stddef.h>
 
+#include <ark/bytes.h>
+
 #define ARK_MAX_CONNECTIONS 1024
 /* Outbound connections use the ids right after the inbound ones. */
 #define ARK_MAX_UPSTREAMS 128
@@ -79,8 +81,7 @@ typedef struct {
     unsigned long conn_id;
 
     /* ARK_EVENT_DATA only. Valid until the update call returns. */
-    const unsigned char *data;
-    size_t length;
+    ArkBytes bytes;
 } ArkEvent;
 
 typedef struct {
@@ -95,8 +96,7 @@ typedef struct {
     unsigned long conn_id;
 
     /* Must stay valid until the next update call; the platform copies it. */
-    const unsigned char *data;
-    size_t length;
+    ArkBytes bytes;
 
     /*
      * Close the connection once everything queued for it has been sent.

@@ -52,3 +52,13 @@ void ark_upstream_release(ArkUpstreams *upstreams, unsigned long conn_id) {
         upstreams->owners[conn_id - ARK_MAX_CONNECTIONS] = 0;
     }
 }
+
+int ark_upstream_route(ArkUpstreams *upstreams, const ArkEvent *event) {
+    int owner = ark_upstream_owner(upstreams, event->conn_id);
+
+    if (event->type == ARK_EVENT_CLOSE) {
+        ark_upstream_release(upstreams, event->conn_id);
+    }
+
+    return owner;
+}

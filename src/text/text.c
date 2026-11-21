@@ -24,28 +24,37 @@ int ark_cstr_equal(const char *a, const char *b) {
     return a[i] == b[i];
 }
 
-int ark_bytes_equal_cstr(const unsigned char *bytes, size_t length, const char *s) {
+int ark_bytes_equal_cstr(ArkBytes bytes, const char *s) {
     size_t i;
 
-    for (i = 0; i < length; ++i) {
-        if (s[i] == '\0' || bytes[i] != (unsigned char)s[i]) {
+    for (i = 0; i < bytes.length; ++i) {
+        if (s[i] == '\0' || bytes.data[i] != (unsigned char)s[i]) {
             return 0;
         }
     }
 
-    return s[length] == '\0';
+    return s[bytes.length] == '\0';
 }
 
-int ark_bytes_equal_cstr_ci(const unsigned char *bytes, size_t length, const char *s) {
+int ark_bytes_equal_cstr_ci(ArkBytes bytes, const char *s) {
     size_t i;
 
-    for (i = 0; i < length; ++i) {
-        if (s[i] == '\0' || ascii_lower(bytes[i]) != (unsigned char)s[i]) {
+    for (i = 0; i < bytes.length; ++i) {
+        if (s[i] == '\0' || ascii_lower(bytes.data[i]) != (unsigned char)s[i]) {
             return 0;
         }
     }
 
-    return s[length] == '\0';
+    return s[bytes.length] == '\0';
+}
+
+ArkBytes ark_cstr_bytes(const char *s) {
+    ArkBytes bytes;
+
+    bytes.data = (const unsigned char *)s;
+    bytes.length = ark_cstr_length(s);
+
+    return bytes;
 }
 
 int ark_is_whitespace(unsigned char c) {
@@ -97,4 +106,13 @@ void ark_buffer_append_unsigned(ArkBuffer *buffer, unsigned long value) {
     }
 
     ark_buffer_append(buffer, reversed, count);
+}
+
+ArkBytes ark_buffer_bytes(const ArkBuffer *buffer) {
+    ArkBytes bytes;
+
+    bytes.data = buffer->data;
+    bytes.length = buffer->length;
+
+    return bytes;
 }

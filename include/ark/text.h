@@ -5,16 +5,20 @@
 
 #include <stddef.h>
 
+#include <ark/bytes.h>
 #include <ark/memory.h>
 
 size_t ark_cstr_length(const char *);
 int ark_cstr_equal(const char *a, const char *b);
 
-/* Whether length bytes equal the null-terminated s. */
-int ark_bytes_equal_cstr(const unsigned char *bytes, size_t length, const char *s);
+/* Whether the bytes equal the null-terminated s. */
+int ark_bytes_equal_cstr(ArkBytes, const char *s);
 
 /* The same, ignoring ASCII case. s must be lowercase. */
-int ark_bytes_equal_cstr_ci(const unsigned char *bytes, size_t length, const char *s);
+int ark_bytes_equal_cstr_ci(ArkBytes, const char *s);
+
+/* A C string's bytes, without the null at the end. */
+ArkBytes ark_cstr_bytes(const char *);
 
 /* Space or tab. */
 int ark_is_whitespace(unsigned char);
@@ -38,5 +42,8 @@ int ark_buffer_push(ArkBuffer *, Memory *, size_t capacity);
 void ark_buffer_append(ArkBuffer *, const void *data, size_t length);
 void ark_buffer_append_cstr(ArkBuffer *, const char *);
 void ark_buffer_append_unsigned(ArkBuffer *, unsigned long);
+
+/* What has been written so far. */
+ArkBytes ark_buffer_bytes(const ArkBuffer *);
 
 #endif

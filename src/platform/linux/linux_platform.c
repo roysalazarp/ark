@@ -377,20 +377,20 @@ static void linux_queue_send(const ArkSend *item) {
         return;
     }
 
-    if (slot->pending_start + slot->pending_length + item->length > PENDING_OUTPUT_SIZE) {
+    if (slot->pending_start + slot->pending_length + item->bytes.length > PENDING_OUTPUT_SIZE) {
         memmove(slot->pending, slot->pending + slot->pending_start, slot->pending_length);
         slot->pending_start = 0;
     }
 
-    if (slot->pending_length + item->length > PENDING_OUTPUT_SIZE) {
+    if (slot->pending_length + item->bytes.length > PENDING_OUTPUT_SIZE) {
         fprintf(stderr, "platform: output buffer full on connection %lu, closing\n", item->conn_id);
         linux_close_slot(slot);
         return;
     }
 
-    if (item->length > 0) {
-        memcpy(slot->pending + slot->pending_start + slot->pending_length, item->data, item->length);
-        slot->pending_length += item->length;
+    if (item->bytes.length > 0) {
+        memcpy(slot->pending + slot->pending_start + slot->pending_length, item->bytes.data, item->bytes.length);
+        slot->pending_length += item->bytes.length;
     }
 
     if (item->close_after) {
@@ -440,8 +440,8 @@ static void linux_accept(int listen_fd, ArkEvent *events, size_t *event_count) {
 
         events[*event_count].type = ARK_EVENT_OPEN;
         events[*event_count].conn_id = id;
-        events[*event_count].data = NULL;
-        events[*event_count].length = 0;
+        events[*event_count].bytes.data = NULL;
+        events[*event_count].bytes.length = 0;
         ++*event_count;
     }
 }
@@ -467,8 +467,8 @@ static void linux_read(Slot *slot, unsigned char *read_buffer, size_t *read_used
     if (received > 0) {
         events[*event_count].type = ARK_EVENT_DATA;
         events[*event_count].conn_id = (unsigned long)(slot - g_slots);
-        events[*event_count].data = read_buffer + *read_used;
-        events[*event_count].length = (size_t)received;
+        events[*event_count].bytes.data = read_buffer + *read_used;
+        events[*event_count].bytes.length = (size_t)received;
         ++*event_count;
         *read_used += (size_t)received;
     } else if (received == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
@@ -490,8 +490,8 @@ static int linux_report_closes(ArkEvent *events, size_t *event_count) {
 
         events[*event_count].type = ARK_EVENT_CLOSE;
         events[*event_count].conn_id = id;
-        events[*event_count].data = NULL;
-        events[*event_count].length = 0;
+        events[*event_count].bytes.data = NULL;
+        events[*event_count].bytes.length = 0;
         ++*event_count;
 
         g_slots[id].state = SLOT_NOTIFIED;
@@ -585,8 +585,8 @@ static void linux_finish_connect(Slot *slot, ArkEvent *events, size_t *event_cou
 
     events[*event_count].type = ARK_EVENT_OPEN;
     events[*event_count].conn_id = (unsigned long)(slot - g_slots);
-    events[*event_count].data = NULL;
-    events[*event_count].length = 0;
+    events[*event_count].bytes.data = NULL;
+    events[*event_count].bytes.length = 0;
     ++*event_count;
 
     linux_watch_slot(slot, 0);
@@ -599,6 +599,7 @@ static void linux_finish_connect(Slot *slot, ArkEvent *events, size_t *event_cou
  * so the app only ever sees IPv4 addresses. If an address changes later, the
  * server needs a restart to see it.
  */
+/* TODO: Very bad code, rewrite this function */
 static int linux_load_endpoints(ArkConfig *config, const char *spec) {
     char copy[ENDPOINTS_SPEC_SIZE];
     char *entry;

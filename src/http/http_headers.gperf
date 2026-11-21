@@ -1,0 +1,141 @@
+%{
+/*
+ * Adapted for Ark from redbean's HTTP parser, part of Cosmopolitan:
+ * https://github.com/jart/cosmopolitan (net/http/)
+ *
+ * Copyright 2020 Justine Alexandra Roberts Tunney
+ *
+ * Permission to use, copy, modify, and/or distribute this software for
+ * any purpose with or without fee is hereby granted, provided that the
+ * above copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+ * PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * Finds the id of a known header name, ignoring case, with a perfect hash.
+ * http_headers.c is generated from this file; after changing it, run in
+ * src/http:
+ *
+ *     gperf --output-file=http_headers.c http_headers.gperf
+ */
+
+#include <ark/http_parser.h>
+%}
+%compare-strncmp
+%ignore-case
+%language=ANSI-C
+%readonly-tables
+%struct-type
+%define lookup-function-name http_lookup_header
+%define hash-function-name http_header_hash
+%define initializer-suffix ,-1
+struct HttpHeaderSlot { const char *name; int code; };
+%%
+Host,                              ARK_HTTP_HEADER_HOST
+Cache-Control,                     ARK_HTTP_HEADER_CACHE_CONTROL
+Connection,                        ARK_HTTP_HEADER_CONNECTION
+Accept,                            ARK_HTTP_HEADER_ACCEPT
+Accept-Language,                   ARK_HTTP_HEADER_ACCEPT_LANGUAGE
+Accept-Encoding,                   ARK_HTTP_HEADER_ACCEPT_ENCODING
+User-Agent,                        ARK_HTTP_HEADER_USER_AGENT
+Referer,                           ARK_HTTP_HEADER_REFERER
+X-Forwarded-For,                   ARK_HTTP_HEADER_X_FORWARDED_FOR
+Origin,                            ARK_HTTP_HEADER_ORIGIN
+Upgrade-Insecure-Requests,         ARK_HTTP_HEADER_UPGRADE_INSECURE_REQUESTS
+Pragma,                            ARK_HTTP_HEADER_PRAGMA
+Cookie,                            ARK_HTTP_HEADER_COOKIE
+DNT,                               ARK_HTTP_HEADER_DNT
+Sec-GPC,                           ARK_HTTP_HEADER_SEC_GPC
+From,                              ARK_HTTP_HEADER_FROM
+If-Modified-Since,                 ARK_HTTP_HEADER_IF_MODIFIED_SINCE
+X-Requested-With,                  ARK_HTTP_HEADER_X_REQUESTED_WITH
+X-Forwarded-Host,                  ARK_HTTP_HEADER_X_FORWARDED_HOST
+X-Forwarded-Proto,                 ARK_HTTP_HEADER_X_FORWARDED_PROTO
+X-CSRF-Token,                      ARK_HTTP_HEADER_X_CSRF_TOKEN
+Save-Data,                         ARK_HTTP_HEADER_SAVE_DATA
+Range,                             ARK_HTTP_HEADER_RANGE
+Content-Length,                    ARK_HTTP_HEADER_CONTENT_LENGTH
+Content-Type,                      ARK_HTTP_HEADER_CONTENT_TYPE
+Vary,                              ARK_HTTP_HEADER_VARY
+Date,                              ARK_HTTP_HEADER_DATE
+Server,                            ARK_HTTP_HEADER_SERVER
+Expires,                           ARK_HTTP_HEADER_EXPIRES
+Content-Encoding,                  ARK_HTTP_HEADER_CONTENT_ENCODING
+Last-Modified,                     ARK_HTTP_HEADER_LAST_MODIFIED
+ETag,                              ARK_HTTP_HEADER_ETAG
+Allow,                             ARK_HTTP_HEADER_ALLOW
+Content-Range,                     ARK_HTTP_HEADER_CONTENT_RANGE
+Accept-Charset,                    ARK_HTTP_HEADER_ACCEPT_CHARSET
+Access-Control-Allow-Credentials,  ARK_HTTP_HEADER_ACCESS_CONTROL_ALLOW_CREDENTIALS
+Access-Control-Allow-Headers,      ARK_HTTP_HEADER_ACCESS_CONTROL_ALLOW_HEADERS
+Access-Control-Allow-Methods,      ARK_HTTP_HEADER_ACCESS_CONTROL_ALLOW_METHODS
+Access-Control-Allow-Origin,       ARK_HTTP_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN
+Access-Control-MaxAge,             ARK_HTTP_HEADER_ACCESS_CONTROL_MAX_AGE
+Access-Control-Method,             ARK_HTTP_HEADER_ACCESS_CONTROL_METHOD
+Access-Control-RequestHeaders,     ARK_HTTP_HEADER_ACCESS_CONTROL_REQUEST_HEADERS
+Access-Control-Request-Method,     ARK_HTTP_HEADER_ACCESS_CONTROL_REQUEST_METHOD
+Access-Control-Request-Methods,    ARK_HTTP_HEADER_ACCESS_CONTROL_REQUEST_METHODS
+Age,                               ARK_HTTP_HEADER_AGE
+Authorization,                     ARK_HTTP_HEADER_AUTHORIZATION
+Content-Base,                      ARK_HTTP_HEADER_CONTENT_BASE
+Content-Description,               ARK_HTTP_HEADER_CONTENT_DESCRIPTION
+Content-Disposition,               ARK_HTTP_HEADER_CONTENT_DISPOSITION
+Content-Language,                  ARK_HTTP_HEADER_CONTENT_LANGUAGE
+Content-Location,                  ARK_HTTP_HEADER_CONTENT_LOCATION
+Content-MD5,                       ARK_HTTP_HEADER_CONTENT_MD5
+Expect,                            ARK_HTTP_HEADER_EXPECT
+If-Match,                          ARK_HTTP_HEADER_IF_MATCH
+If-None-Match,                     ARK_HTTP_HEADER_IF_NONE_MATCH
+If-Range,                          ARK_HTTP_HEADER_IF_RANGE
+If-Unmodified-Since,               ARK_HTTP_HEADER_IF_UNMODIFIED_SINCE
+Keep-Alive,                        ARK_HTTP_HEADER_KEEP_ALIVE
+Link,                              ARK_HTTP_HEADER_LINK
+Location,                          ARK_HTTP_HEADER_LOCATION
+Max-Forwards,                      ARK_HTTP_HEADER_MAX_FORWARDS
+Proxy-Authenticate,                ARK_HTTP_HEADER_PROXY_AUTHENTICATE
+Proxy-Authorization,               ARK_HTTP_HEADER_PROXY_AUTHORIZATION
+Proxy-Connection,                  ARK_HTTP_HEADER_PROXY_CONNECTION
+Public,                            ARK_HTTP_HEADER_PUBLIC
+Retry-After,                       ARK_HTTP_HEADER_RETRY_AFTER
+TE,                                ARK_HTTP_HEADER_TE
+Trailer,                           ARK_HTTP_HEADER_TRAILER
+Transfer-Encoding,                 ARK_HTTP_HEADER_TRANSFER_ENCODING
+Upgrade,                           ARK_HTTP_HEADER_UPGRADE
+Warning,                           ARK_HTTP_HEADER_WARNING
+WWW-Authenticate,                  ARK_HTTP_HEADER_WWW_AUTHENTICATE
+Via,                               ARK_HTTP_HEADER_VIA
+Strict-Transport-Security,         ARK_HTTP_HEADER_STRICT_TRANSPORT_SECURITY
+X-Frame-Options,                   ARK_HTTP_HEADER_X_FRAME_OPTIONS
+X-Content-Type-Options,            ARK_HTTP_HEADER_X_CONTENT_TYPE_OPTIONS
+Alt-Svc,                           ARK_HTTP_HEADER_ALT_SVC
+Referrer-Policy,                   ARK_HTTP_HEADER_REFERRER_POLICY
+X-XSS-Protection,                  ARK_HTTP_HEADER_X_XSS_PROTECTION
+Accept-Ranges,                     ARK_HTTP_HEADER_ACCEPT_RANGES
+Set-Cookie,                        ARK_HTTP_HEADER_SET_COOKIE
+Sec-CH-UA,                         ARK_HTTP_HEADER_SEC_CH_UA
+Sec-CH-UA-Mobile,                  ARK_HTTP_HEADER_SEC_CH_UA_MOBILE
+Sec-CH-UA-Platform,                ARK_HTTP_HEADER_SEC_CH_UA_PLATFORM
+Sec-Fetch-Site,                    ARK_HTTP_HEADER_SEC_FETCH_SITE
+Sec-Fetch-Mode,                    ARK_HTTP_HEADER_SEC_FETCH_MODE
+Sec-Fetch-User,                    ARK_HTTP_HEADER_SEC_FETCH_USER
+Sec-Fetch-Dest,                    ARK_HTTP_HEADER_SEC_FETCH_DEST
+CF-RAY,                            ARK_HTTP_HEADER_CF_RAY
+CF-Visitor,                        ARK_HTTP_HEADER_CF_VISITOR
+CF-Connecting-IP,                  ARK_HTTP_HEADER_CF_CONNECTING_IP
+CF-IPCountry,                      ARK_HTTP_HEADER_CF_IPCOUNTRY
+CDN-Loop,                          ARK_HTTP_HEADER_CDN_LOOP
+%%
+
+int ark_http_header_id(const unsigned char *name, size_t length) {
+    const struct HttpHeaderSlot *slot = http_lookup_header((const char *)name, length);
+
+    return slot != NULL ? slot->code : -1;
+}

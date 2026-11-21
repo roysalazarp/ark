@@ -82,6 +82,44 @@ check "HTTP/1.0 keep-alive on request" "keep-alive" \
 check "Connection: close honoured" "close" \
     "$(send 'GET / HTTP/1.1\r\nConnection: close\r\n\r\n' | grep -ai '^connection:' | cut -d' ' -f2)"
 
+check "request split right after the method" "200" \
+    "$( (printf 'GET'; sleep 0.3; printf ' / HTTP/1.1\r\nConnection: close\r\n\r\n') | nc -q 1 127.0.0.1 "$PORT" | tr -d '\r' | statuses)"
+
+check "request sent one byte at a time" "200" \
+    "$(request='GET /header/x-thing HTTP/1.1\r\nX-Thing: slow\r\nConnection: close\r\n\r\n'
+       (printf "$request" | od -An -v -tx1 | tr -s ' ' '\n' | grep . | while read -r hex; do printf "\\x$hex"; sleep 0.01; done; sleep 0.3) |
+       nc -q 1 127.0.0.1 "$PORT" | tr -d '\r' | statuses)"
+
+check "known header is readable" "curl/test" \
+    "$(curl -s -A curl/test "http://127.0.0.1:$PORT/header/User-Agent")"
+
+check "header names ignore case" "1.2.3.4" \
+    "$(curl -s -H 'X-Forwarded-For: 1.2.3.4' "http://127.0.0.1:$PORT/header/x-forwarded-for")"
+
+check "unknown header is readable" "hello" \
+    "$(curl -s -H 'X-Thing: hello' "http://127.0.0.1:$PORT/header/X-Thing")"
+
+check "missing header gets 404" "404" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/header/X-Nope")"
+
+check "repeatable header gives the first" "text/plain" \
+    "$(send 'GET /header/Accept HTTP/1.1\r\nAccept: text/plain\r\nAccept: text/html\r\nConnection: close\r\n\r\n' | tail -1)"
+
+check "duplicate Host rejected" "400" \
+    "$(send 'GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n' | statuses)"
+
+check "comma in Content-Length rejected" "400" \
+    "$(send 'POST / HTTP/1.1\r\nContent-Length: 5,5\r\n\r\nhello' | statuses)"
+
+check "HTTP/0.9 rejected" "400" \
+    "$(send 'GET /\r\n\r\n' | statuses)"
+
+check "too many headers rejected" "431" \
+    "$(send "GET / HTTP/1.1\r\n$(for i in $(seq 40); do printf 'X-%s: y\r\n' "$i"; done)\r\n" | statuses)"
+
+check "empty lines before the request are skipped" "200" \
+    "$(send '\r\n\r\nGET / HTTP/1.1\r\nConnection: close\r\n\r\n' | statuses)"
+
 # Sends a request and reads until the server closes; prints "<statuses> <seconds>".
 send_and_time() {
     local start result

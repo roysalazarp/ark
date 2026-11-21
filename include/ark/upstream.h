@@ -28,7 +28,15 @@ int ark_upstream_open(ArkUpstreams *, ArkOutput *, const ArkEndpoint *, int owne
 /* Returns 0 for ids that are free or not outbound. */
 int ark_upstream_owner(const ArkUpstreams *, unsigned long conn_id);
 
-/* Call after passing on an id's CLOSE event, never before: ids are only reused after it. */
+/*
+ * Returns the owner of an outbound event's id, or 0. On a CLOSE it also frees
+ * the id, so it can't be forgotten: pass the event to the owner right after.
+ * The platform never hands a freed id to a new connection before this update
+ * ends, so the owner still sees its own CLOSE.
+ */
+int ark_upstream_route(ArkUpstreams *, const ArkEvent *);
+
+/* The same freeing, for apps that route events themselves. */
 void ark_upstream_release(ArkUpstreams *, unsigned long conn_id);
 
 #endif

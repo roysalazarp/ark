@@ -10,45 +10,49 @@ typedef struct {
     int is_open;
     /* The module has asked the platform to close it; ignore anything else it sends. */
     int closing;
-    /* A handler is running for its request right now, and whether it answered. */
-    int handling;
-    int answered;
+    /* In the ready list, waiting for ark_http_next_request to look at it. */
+    int ready;
+    /*
+     * A request was handed to the app and isn't answered yet. If it came from
+     * ark_http_next_request, its bytes are still at the front of the buffer.
+     */
+    int answering;
+    int answering_in_buffer;
     /*
      * Its answer is waiting on an outbound call (see ark_http_park). Requests
      * behind it are held back, and it isn't closed for being idle.
      */
     int waiting;
     unsigned long wait_serial;
-    /* For the request being handled or waited on. */
+    /* For the request being answered or waited on. */
     int keep_alive;
     unsigned long last_active_ms;
     unsigned long request_started_ms;
+
     size_t request_length;
     unsigned char request[ARK_HTTP_REQUEST_SIZE];
+    /* Bytes from this tick's read that didn't fit yet. Only valid until the update returns. */
+    ArkBytes leftover;
+
+    /* The request at the front of the buffer, parsed as its bytes arrive. */
+    ArkHttpMessage message;
+    /* 0 until its start line and headers are complete. */
+    size_t header_length;
+    /* Headers plus body. */
+    size_t total_length;
 } HttpConnection;
+
+/* The parser keeps offsets as shorts. */
+typedef char http_request_size_fits_parser[ARK_HTTP_REQUEST_SIZE <= 32767 ? 1 : -1];
 
 struct ArkHttp {
     HttpConnection connections[ARK_MAX_CONNECTIONS];
+    /* Clients that may have a request ready, oldest first. */
+    unsigned long ready[ARK_MAX_CONNECTIONS];
+    size_t ready_start;
+    size_t ready_count;
     unsigned long next_wait_serial;
 };
-
-typedef enum {
-    PARSE_INCOMPLETE,
-    PARSE_OK,
-    PARSE_BAD_REQUEST,
-    PARSE_NOT_IMPLEMENTED,
-    PARSE_TOO_LARGE
-} ParseResult;
-
-typedef struct {
-    const unsigned char *method;
-    size_t method_length;
-    const unsigned char *path;
-    size_t path_length;
-    int keep_alive;
-    /* Headers plus body: how many bytes of the buffer this request uses. */
-    size_t total_length;
-} Request;
 
 /* ---- Output ------------------------------------------------------------ */
 
@@ -68,16 +72,27 @@ static void http_queue_send(const ArkHttpContext *context, unsigned long conn_id
 
     send = &output->sends[output->send_count++];
     send->conn_id = conn_id;
-    send->data = data;
-    send->length = length;
+    send->bytes.data = data;
+    send->bytes.length = length;
     send->close_after = close_after;
 }
 
-static void http_send(const ArkHttpContext *context, unsigned long conn_id,
-                      const char *status, const char *body, int keep_alive) {
+void ark_http_write_head(ArkBuffer *buffer, const char *status, const char *content_type,
+                         size_t content_length, int keep_alive) {
+    ark_buffer_append_cstr(buffer, "HTTP/1.1 ");
+    ark_buffer_append_cstr(buffer, status);
+    ark_buffer_append_cstr(buffer, "\r\nContent-Type: ");
+    ark_buffer_append_cstr(buffer, content_type);
+    ark_buffer_append_cstr(buffer, "\r\nContent-Length: ");
+    ark_buffer_append_unsigned(buffer, (unsigned long)content_length);
+    ark_buffer_append_cstr(buffer, keep_alive ? "\r\nConnection: keep-alive\r\n\r\n"
+                                              : "\r\nConnection: close\r\n\r\n");
+}
+
+static void http_send(const ArkHttpContext *context, unsigned long conn_id, const char *status,
+                      const char *content_type, ArkBytes body, int keep_alive) {
     ArkBuffer buffer;
-    size_t body_length = ark_cstr_length(body);
-    size_t capacity = body_length + ark_cstr_length(status) + 128;
+    size_t capacity = body.length + ark_cstr_length(status) + ark_cstr_length(content_type) + 128;
 
     /* Scratch memory lives until the next update, as ArkSend requires. */
     if (!ark_buffer_push(&buffer, context->scratch, capacity)) {
@@ -85,13 +100,8 @@ static void http_send(const ArkHttpContext *context, unsigned long conn_id,
         return;
     }
 
-    ark_buffer_append_cstr(&buffer, "HTTP/1.1 ");
-    ark_buffer_append_cstr(&buffer, status);
-    ark_buffer_append_cstr(&buffer, "\r\nContent-Type: text/plain\r\nContent-Length: ");
-    ark_buffer_append_unsigned(&buffer, (unsigned long)body_length);
-    ark_buffer_append_cstr(&buffer, keep_alive ? "\r\nConnection: keep-alive\r\n\r\n"
-                                               : "\r\nConnection: close\r\n\r\n");
-    ark_buffer_append(&buffer, body, body_length);
+    ark_http_write_head(&buffer, status, content_type, body.length, keep_alive);
+    ark_buffer_append(&buffer, body.data, body.length);
 
     http_queue_send(context, conn_id, buffer.data, buffer.length, !keep_alive);
 }
@@ -104,44 +114,22 @@ static void http_close(const ArkHttpContext *context, unsigned long conn_id, Htt
 /* Sends an error response, closes the connection and stops reading from it. */
 static void http_fail(const ArkHttpContext *context, unsigned long conn_id, HttpConnection *conn,
                       const char *status) {
-    http_send(context, conn_id, status, status, 0);
+    http_send(context, conn_id, status, "text/plain", ark_cstr_bytes(status), 0);
     conn->closing = 1;
 }
 
 /* ---- Parsing ----------------------------------------------------------- */
 
-/*
- * Finds the "\r\n" ending the line that starts at start. Rejects bare CR,
- * bare LF and NUL, which proxies and servers can disagree about.
- */
-static int find_line_end(const unsigned char *data, size_t limit, size_t start, size_t *line_end) {
-    size_t i = start;
-
-    while (i < limit && data[i] != '\r') {
-        if (data[i] == '\n' || data[i] == '\0') {
-            return 0;
-        }
-        ++i;
-    }
-
-    if (i + 1 >= limit || data[i + 1] != '\n') {
-        return 0;
-    }
-
-    *line_end = i;
-    return 1;
-}
-
-static int parse_content_length(const unsigned char *value, size_t length, size_t *result) {
+static int parse_content_length(ArkBytes value, size_t *result) {
     size_t number = 0;
     size_t i;
 
-    if (length == 0) {
+    if (value.length == 0) {
         return 0;
     }
 
-    for (i = 0; i < length; ++i) {
-        if (value[i] < '0' || value[i] > '9') {
+    for (i = 0; i < value.length; ++i) {
+        if (value.data[i] < '0' || value.data[i] > '9') {
             return 0;
         }
 
@@ -150,37 +138,38 @@ static int parse_content_length(const unsigned char *value, size_t length, size_
             number = ARK_HTTP_REQUEST_SIZE + 1;
             continue;
         }
-        number = number * 10 + (size_t)(value[i] - '0');
+        number = number * 10 + (size_t)(value.data[i] - '0');
     }
 
     *result = number;
     return 1;
 }
-
-/* Looks for "close" and "keep-alive" in a comma-separated Connection value. */
-static void parse_connection(const unsigned char *value, size_t length,
-                             int *wants_close, int *wants_keep_alive) {
+static void parse_connection(ArkBytes value, int *wants_close, int *wants_keep_alive) {
     size_t start = 0;
 
-    while (start < length) {
+    while (start < value.length) {
         size_t end = start;
         size_t token_end;
+        ArkBytes token;
 
-        while (end < length && value[end] != ',') {
+        while (end < value.length && value.data[end] != ',') {
             ++end;
         }
 
         token_end = end;
-        while (start < token_end && ark_is_whitespace(value[start])) {
+        while (start < token_end && ark_is_whitespace(value.data[start])) {
             ++start;
         }
-        while (token_end > start && ark_is_whitespace(value[token_end - 1])) {
+        while (token_end > start && ark_is_whitespace(value.data[token_end - 1])) {
             --token_end;
         }
 
-        if (ark_bytes_equal_cstr_ci(value + start, token_end - start, "close")) {
+        token.data = value.data + start;
+        token.length = token_end - start;
+
+        if (ark_bytes_equal_cstr_ci(token, "close")) {
             *wants_close = 1;
-        } else if (ark_bytes_equal_cstr_ci(value + start, token_end - start, "keep-alive")) {
+        } else if (ark_bytes_equal_cstr_ci(token, "keep-alive")) {
             *wants_keep_alive = 1;
         }
 
@@ -188,228 +177,184 @@ static void parse_connection(const unsigned char *value, size_t length,
     }
 }
 
+/* A known header straight from its slot: no name lookup, as this runs for every request. */
+static int http_known_header(const HttpConnection *conn, int id, ArkBytes *value) {
+    ArkHttpSlice slice = conn->message.headers[id];
+
+    if (!slice.a) {
+        return 0;
+    }
+
+    value->data = conn->request + slice.a;
+    value->length = (size_t)(slice.b - slice.a);
+    return 1;
+}
+
 /*
- * Parses the request at the start of data. Strict on purpose: anything a
- * proxy might read differently (bare LF, folded or spaced header names,
- * duplicate Content-Length, Transfer-Encoding) is rejected, because with
- * keep-alive a framing disagreement lets one request hide inside another.
+ * Ark's rules on top of the parser, checked once the headers are complete.
+ * Strict on purpose: anything a proxy might read differently is rejected,
+ * because with keep-alive a disagreement lets one request hide inside
+ * another. Returns NULL if the request is fine, or the status to fail with.
  */
-static ParseResult parse_request(const unsigned char *data, size_t length, Request *request) {
-    size_t header_length = 0;
+static const char *http_check_request(HttpConnection *conn) {
+    const ArkHttpMessage *message = &conn->message;
+    ArkBytes value;
     size_t content_length = 0;
-    int has_content_length = 0;
     int wants_close = 0;
     int wants_keep_alive = 0;
-    int is_http_1_0;
-    size_t line_start;
-    size_t line_end;
-    size_t i;
 
-    for (i = 0; i + 3 < length; ++i) {
-        if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
-            header_length = i + 4;
-            break;
-        }
+    if (message->version != 10 && message->version != 11) {
+        return "400 Bad Request";
     }
 
-    if (header_length == 0) {
-        return PARSE_INCOMPLETE;
+    if (message->headers[ARK_HTTP_HEADER_TRANSFER_ENCODING].a) {
+        return "501 Not Implemented";
     }
 
-    /* Request line: METHOD SP PATH SP VERSION */
-    if (!find_line_end(data, header_length, 0, &line_end)) {
-        return PARSE_BAD_REQUEST;
+    if (http_known_header(conn, ARK_HTTP_HEADER_CONTENT_LENGTH, &value) &&
+        !parse_content_length(value, &content_length)) {
+        return "400 Bad Request";
     }
 
-    i = 0;
-    while (i < line_end && data[i] != ' ') {
-        ++i;
-    }
-    if (i == 0 || i == line_end) {
-        return PARSE_BAD_REQUEST;
-    }
-    request->method = data;
-    request->method_length = i;
-
-    line_start = ++i;
-    while (i < line_end && data[i] != ' ') {
-        ++i;
-    }
-    if (i == line_start || i == line_end) {
-        return PARSE_BAD_REQUEST;
-    }
-    request->path = data + line_start;
-    request->path_length = i - line_start;
-
-    ++i;
-    if (ark_bytes_equal_cstr(data + i, line_end - i, "HTTP/1.1")) {
-        is_http_1_0 = 0;
-    } else if (ark_bytes_equal_cstr(data + i, line_end - i, "HTTP/1.0")) {
-        is_http_1_0 = 1;
-    } else {
-        return PARSE_BAD_REQUEST;
+    if (content_length > ARK_HTTP_REQUEST_SIZE - conn->header_length) {
+        return "413 Content Too Large";
     }
 
-    /* Header lines, up to the blank line that ends the headers. */
-    for (line_start = line_end + 2; line_start < header_length - 2; line_start = line_end + 2) {
-        size_t name_end;
-        size_t value_start;
-        size_t value_end;
-
-        if (!find_line_end(data, header_length, line_start, &line_end)) {
-            return PARSE_BAD_REQUEST;
-        }
-
-        /* Obsolete line folding. */
-        if (ark_is_whitespace(data[line_start])) {
-            return PARSE_BAD_REQUEST;
-        }
-
-        name_end = line_start;
-        while (name_end < line_end && data[name_end] != ':') {
-            if (ark_is_whitespace(data[name_end])) {
-                return PARSE_BAD_REQUEST;
-            }
-            ++name_end;
-        }
-        if (name_end == line_start || name_end == line_end) {
-            return PARSE_BAD_REQUEST;
-        }
-
-        value_start = name_end + 1;
-        value_end = line_end;
-        while (value_start < value_end && ark_is_whitespace(data[value_start])) {
-            ++value_start;
-        }
-        while (value_end > value_start && ark_is_whitespace(data[value_end - 1])) {
-            --value_end;
-        }
-
-        if (ark_bytes_equal_cstr_ci(data + line_start, name_end - line_start, "content-length")) {
-            if (has_content_length ||
-                !parse_content_length(data + value_start, value_end - value_start, &content_length)) {
-                return PARSE_BAD_REQUEST;
-            }
-            has_content_length = 1;
-        } else if (ark_bytes_equal_cstr_ci(data + line_start, name_end - line_start, "transfer-encoding")) {
-            return PARSE_NOT_IMPLEMENTED;
-        } else if (ark_bytes_equal_cstr_ci(data + line_start, name_end - line_start, "connection")) {
-            parse_connection(data + value_start, value_end - value_start, &wants_close, &wants_keep_alive);
-        }
+    if (http_known_header(conn, ARK_HTTP_HEADER_CONNECTION, &value)) {
+        parse_connection(value, &wants_close, &wants_keep_alive);
     }
 
-    if (content_length > ARK_HTTP_REQUEST_SIZE - header_length) {
-        return PARSE_TOO_LARGE;
-    }
-
-    request->total_length = header_length + content_length;
-    if (length < request->total_length) {
-        return PARSE_INCOMPLETE;
-    }
+    conn->total_length = conn->header_length + content_length;
 
     /* HTTP/1.1 keeps the connection open by default; HTTP/1.0 only when asked. */
-    request->keep_alive = is_http_1_0 ? (wants_keep_alive && !wants_close) : !wants_close;
+    conn->keep_alive = message->version == 10 ? (wants_keep_alive && !wants_close) : !wants_close;
 
-    return PARSE_OK;
+    return NULL;
 }
 
 /* ---- Requests ---------------------------------------------------------- */
 
-/* Handles every complete request in the buffer, in order. */
-static void http_process_requests(const ArkHttpContext *context, unsigned long conn_id,
-                                  HttpConnection *conn, ArkHttpHandler *handler, void *app) {
-    while (!conn->closing && !conn->waiting && conn->request_length > 0) {
-        Request parsed;
-        ArkHttpRequest request;
-        ParseResult result = parse_request(conn->request, conn->request_length, &parsed);
-        size_t remaining;
+static void http_mark_ready(ArkHttp *http, unsigned long conn_id) {
+    HttpConnection *conn = &http->connections[conn_id];
 
-        if (result == PARSE_INCOMPLETE) {
-            if (conn->request_length == ARK_HTTP_REQUEST_SIZE) {
-                http_fail(context, conn_id, conn, "431 Request Header Fields Too Large");
-            }
-            return;
-        }
+    if (conn->ready) {
+        return;
+    }
 
-        if (result == PARSE_BAD_REQUEST) {
-            http_fail(context, conn_id, conn, "400 Bad Request");
-            return;
-        }
+    conn->ready = 1;
+    http->ready[(http->ready_start + http->ready_count) % ARK_MAX_CONNECTIONS] = conn_id;
+    ++http->ready_count;
+}
 
-        if (result == PARSE_NOT_IMPLEMENTED) {
-            http_fail(context, conn_id, conn, "501 Not Implemented");
-            return;
-        }
+/* Moves as much of the leftover bytes into the buffer as fits. */
+static void http_take_leftover(const ArkHttpContext *context, HttpConnection *conn) {
+    size_t take = ARK_HTTP_REQUEST_SIZE - conn->request_length;
 
-        if (result == PARSE_TOO_LARGE) {
-            http_fail(context, conn_id, conn, "413 Content Too Large");
-            return;
-        }
+    if (take > conn->leftover.length) {
+        take = conn->leftover.length;
+    }
 
-        request.conn_id = conn_id;
-        request.method = parsed.method;
-        request.method_length = parsed.method_length;
-        request.path = parsed.path;
-        request.path_length = parsed.path_length;
+    if (take == 0) {
+        return;
+    }
 
-        /* The handler reads the request now, before its bytes are discarded. */
-        conn->keep_alive = parsed.keep_alive;
-        conn->handling = 1;
-        conn->answered = 0;
-
-        handler(app, &request);
-
-        conn->handling = 0;
-        if (!conn->answered) {
-            http_log(context, "http: a handler did not answer, sending 500");
-            http_send(context, conn_id, "500 Internal Server Error", "No Response\n", conn->keep_alive);
-        }
-
-        if (!parsed.keep_alive) {
-            conn->closing = 1;
-        }
-
-        /* Move any pipelined bytes to the front. dest < src, so a forward copy is safe. */
-        remaining = conn->request_length - parsed.total_length;
-        ark_memory_copy(conn->request, conn->request + parsed.total_length, remaining);
-        conn->request_length = remaining;
+    if (conn->request_length == 0) {
         conn->request_started_ms = context->now_ms;
+    }
+
+    ark_memory_copy(conn->request + conn->request_length, conn->leftover.data, take);
+    conn->request_length += take;
+    conn->leftover.data += take;
+    conn->leftover.length -= take;
+}
+
+/* Drops the answered request's bytes from the front of the buffer. */
+static void http_consume_request(HttpConnection *conn) {
+    size_t remaining = conn->request_length - conn->total_length;
+
+    /* dest < src, so a forward copy is safe. */
+    ark_memory_copy(conn->request, conn->request + conn->total_length, remaining);
+    conn->request_length = remaining;
+    conn->answering_in_buffer = 0;
+
+    ark_http_message_init(&conn->message, ARK_HTTP_PARSE_REQUEST);
+    conn->header_length = 0;
+    conn->total_length = 0;
+}
+
+/*
+ * Tries to complete the request at the front of the buffer. Returns 1 when
+ * it is complete, 0 when more bytes are needed, and -1 when it failed (the
+ * client has been answered and is closing).
+ */
+static int http_read_request(const ArkHttpContext *context, unsigned long conn_id, HttpConnection *conn) {
+    http_take_leftover(context, conn);
+
+    if (conn->request_length == 0) {
+        return 0;
+    }
+
+    if (conn->header_length == 0) {
+        int result = ark_http_parse(&conn->message, conn->request, conn->request_length, ARK_HTTP_REQUEST_SIZE);
+        const char *error;
+
+        if (result == 0) {
+            return 0;
+        }
+
+        if (result < 0) {
+            http_fail(context, conn_id, conn,
+                      conn->message.too_many_headers || conn->request_length == ARK_HTTP_REQUEST_SIZE
+                          ? "431 Request Header Fields Too Large"
+                          : "400 Bad Request");
+            return -1;
+        }
+
+        conn->header_length = (size_t)result;
+
+        error = http_check_request(conn);
+        if (error != NULL) {
+            http_fail(context, conn_id, conn, error);
+            return -1;
+        }
+    }
+
+    /* Wait for the whole body. */
+    return conn->request_length >= conn->total_length ? 1 : 0;
+}
+
+/* After an answer: release the request and look for the next one. */
+static void http_answered(ArkHttp *http, const ArkHttpContext *context, unsigned long conn_id, HttpConnection *conn) {
+    conn->answering = 0;
+
+    if (conn->answering_in_buffer) {
+        http_consume_request(conn);
+    }
+
+    /* The next request's clocks start now. */
+    conn->last_active_ms = context->now_ms;
+    conn->request_started_ms = context->now_ms;
+
+    if (!conn->keep_alive) {
+        conn->closing = 1;
+        return;
+    }
+
+    if (conn->request_length > 0 || conn->leftover.length > 0) {
+        http_mark_ready(http, conn_id);
     }
 }
 
-static void http_receive(const ArkHttpContext *context, const ArkEvent *event,
-                         HttpConnection *conn, ArkHttpHandler *handler, void *app) {
-    const unsigned char *data = event->data;
-    size_t remaining = event->length;
+/* Finds the client a request handed to the app belongs to, if it's still waiting for an answer. */
+static HttpConnection *http_answering(ArkHttp *http, const ArkHttpRequest *request) {
+    HttpConnection *conn;
 
-    conn->last_active_ms = context->now_ms;
-
-    /* A single read can hold more than the buffer when requests are pipelined. */
-    while (remaining > 0 && !conn->closing) {
-        size_t take = ARK_HTTP_REQUEST_SIZE - conn->request_length;
-
-        if (take > remaining) {
-            take = remaining;
-        }
-
-        if (take == 0) {
-            /* Only possible while waiting on an outbound call with a full buffer. */
-            conn->waiting = 0;
-            http_fail(context, event->conn_id, conn, "431 Request Header Fields Too Large");
-            break;
-        }
-
-        if (conn->request_length == 0) {
-            conn->request_started_ms = context->now_ms;
-        }
-
-        ark_memory_copy(conn->request + conn->request_length, data, take);
-        conn->request_length += take;
-        data += take;
-        remaining -= take;
-
-        http_process_requests(context, event->conn_id, conn, handler, app);
+    if (request->conn_id >= ARK_MAX_CONNECTIONS) {
+        return NULL;
     }
+
+    conn = &http->connections[request->conn_id];
+    return conn->is_open && conn->answering ? conn : NULL;
 }
 
 /* ---- Interface --------------------------------------------------------- */
@@ -418,8 +363,7 @@ ArkHttp *ark_http_create(Memory *permanent) {
     return (ArkHttp *)ark_memory_push(permanent, sizeof(ArkHttp));
 }
 
-void ark_http_handle_event(ArkHttp *http, const ArkHttpContext *context, const ArkEvent *event,
-                           ArkHttpHandler *handler, void *app) {
+void ark_http_handle_event(ArkHttp *http, const ArkHttpContext *context, const ArkEvent *event) {
     HttpConnection *conn;
 
     if (event->conn_id >= ARK_MAX_CONNECTIONS) {
@@ -430,27 +374,75 @@ void ark_http_handle_event(ArkHttp *http, const ArkHttpContext *context, const A
 
     switch (event->type) {
     case ARK_EVENT_OPEN:
+        ark_memory_zero(conn, sizeof(*conn));
         conn->is_open = 1;
-        conn->closing = 0;
-        conn->handling = 0;
-        conn->waiting = 0;
-        conn->request_length = 0;
         conn->last_active_ms = context->now_ms;
+        ark_http_message_init(&conn->message, ARK_HTTP_PARSE_REQUEST);
         break;
 
     case ARK_EVENT_CLOSE:
+        /* Stale entries in the ready list are skipped because it isn't open. */
         conn->is_open = 0;
-        conn->closing = 0;
+        conn->answering = 0;
         conn->waiting = 0;
-        conn->request_length = 0;
+        conn->leftover.length = 0;
         break;
 
     case ARK_EVENT_DATA:
-        if (conn->is_open && !conn->closing) {
-            http_receive(context, event, conn, handler, app);
+        if (!conn->is_open || conn->closing) {
+            break;
         }
+
+        conn->last_active_ms = context->now_ms;
+
+        if (conn->leftover.length > 0) {
+            /* The app didn't take the previous bytes; they can't be kept. */
+            http_fail(context, event->conn_id, conn, "431 Request Header Fields Too Large");
+            break;
+        }
+
+        conn->leftover = event->bytes;
+        http_take_leftover(context, conn);
+        http_mark_ready(http, event->conn_id);
         break;
     }
+}
+
+int ark_http_next_request(ArkHttp *http, const ArkHttpContext *context, ArkHttpRequest *request) {
+    while (http->ready_count > 0) {
+        unsigned long conn_id = http->ready[http->ready_start];
+        HttpConnection *conn = &http->connections[conn_id];
+
+        http->ready_start = (http->ready_start + 1) % ARK_MAX_CONNECTIONS;
+        --http->ready_count;
+        conn->ready = 0;
+
+        if (!conn->is_open || conn->closing || conn->waiting || conn->answering) {
+            continue;
+        }
+
+        if (http_read_request(context, conn_id, conn) != 1) {
+            continue;
+        }
+
+        conn->answering = 1;
+        conn->answering_in_buffer = 1;
+
+        request->conn_id = conn_id;
+        request->method.data = conn->request + conn->message.method.a;
+        request->method.length = (size_t)(conn->message.method.b - conn->message.method.a);
+        request->path.data = conn->request + conn->message.uri.a;
+        request->path.length = (size_t)(conn->message.uri.b - conn->message.uri.a);
+        request->body.data = conn->request + conn->header_length;
+        request->body.length = conn->total_length - conn->header_length;
+        request->keep_alive = conn->keep_alive;
+        request->message = &conn->message;
+        request->data = conn->request;
+
+        return 1;
+    }
+
+    return 0;
 }
 
 void ark_http_update(ArkHttp *http, const ArkHttpContext *context) {
@@ -459,7 +451,26 @@ void ark_http_update(ArkHttp *http, const ArkHttpContext *context) {
     for (id = 0; id < ARK_MAX_CONNECTIONS; ++id) {
         HttpConnection *conn = &http->connections[id];
 
-        if (!conn->is_open || conn->closing || conn->waiting) {
+        if (!conn->is_open || conn->closing) {
+            continue;
+        }
+
+        if (conn->answering) {
+            ArkHttpRequest forgotten;
+
+            http_log(context, "http: a request was not answered, sending 500");
+            forgotten.conn_id = id;
+            ark_http_respond_text(http, context, &forgotten, "500 Internal Server Error", "No Response\n");
+            continue;
+        }
+
+        if (conn->leftover.length > 0) {
+            /* Bytes the app never asked for; the platform reuses their memory after this update. */
+            http_fail(context, id, conn, "431 Request Header Fields Too Large");
+            continue;
+        }
+
+        if (conn->waiting) {
             continue;
         }
 
@@ -473,41 +484,61 @@ void ark_http_update(ArkHttp *http, const ArkHttpContext *context) {
     }
 }
 
-void ark_http_respond(ArkHttp *http, const ArkHttpContext *context, unsigned long conn_id,
-                      const char *status, const char *body) {
-    HttpConnection *conn;
-
-    if (conn_id >= ARK_MAX_CONNECTIONS) {
-        return;
+int ark_http_header(const ArkHttpRequest *request, const char *name, ArkBytes *value) {
+    if (request->message == NULL) {
+        return 0;
     }
 
-    conn = &http->connections[conn_id];
-    if (!conn->handling || conn->answered) {
-        return;
-    }
-
-    conn->answered = 1;
-    http_send(context, conn_id, status, body, conn->keep_alive);
+    return ark_http_find_header(request->message, request->data, name, value);
 }
 
-ArkHttpTicket ark_http_park(ArkHttp *http, unsigned long conn_id) {
+void ark_http_respond(ArkHttp *http, const ArkHttpContext *context, const ArkHttpRequest *request,
+                      const char *status, const char *content_type, ArkBytes body) {
+    HttpConnection *conn = http_answering(http, request);
+
+    if (conn == NULL) {
+        return;
+    }
+
+    http_send(context, request->conn_id, status, content_type, body, conn->keep_alive);
+    http_answered(http, context, request->conn_id, conn);
+}
+
+void ark_http_respond_text(ArkHttp *http, const ArkHttpContext *context, const ArkHttpRequest *request,
+                           const char *status, const char *text) {
+    ark_http_respond(http, context, request, status, "text/plain", ark_cstr_bytes(text));
+}
+
+void ark_http_respond_raw(ArkHttp *http, const ArkHttpContext *context, const ArkHttpRequest *request,
+                          ArkBytes response) {
+    HttpConnection *conn = http_answering(http, request);
+
+    if (conn == NULL) {
+        return;
+    }
+
+    http_queue_send(context, request->conn_id, response.data, response.length, !conn->keep_alive);
+    http_answered(http, context, request->conn_id, conn);
+}
+
+ArkHttpTicket ark_http_park(ArkHttp *http, const ArkHttpRequest *request) {
+    HttpConnection *conn = http_answering(http, request);
     ArkHttpTicket ticket;
-    HttpConnection *conn;
 
     /* Serial 0 never matches, so a ticket that couldn't be given is harmless. */
-    ticket.conn_id = conn_id;
+    ticket.conn_id = request->conn_id;
     ticket.serial = 0;
 
-    if (conn_id >= ARK_MAX_CONNECTIONS) {
+    if (conn == NULL) {
         return ticket;
     }
 
-    conn = &http->connections[conn_id];
-    if (!conn->handling || conn->answered) {
-        return ticket;
+    conn->answering = 0;
+    if (conn->answering_in_buffer) {
+        /* The request's bytes go now, so the app must have copied what it needs. */
+        http_consume_request(conn);
     }
 
-    conn->answered = 1;
     conn->waiting = 1;
     conn->wait_serial = ++http->next_wait_serial;
     ticket.serial = conn->wait_serial;
@@ -526,21 +557,20 @@ int ark_http_is_parked(const ArkHttp *http, ArkHttpTicket ticket) {
     return conn->is_open && conn->waiting && conn->wait_serial == ticket.serial;
 }
 
-void ark_http_resume(ArkHttp *http, const ArkHttpContext *context, ArkHttpTicket ticket,
-                     const char *status, const char *body, ArkHttpHandler *handler, void *app) {
+int ark_http_resume(ArkHttp *http, ArkHttpTicket ticket, ArkHttpRequest *request) {
     HttpConnection *conn;
 
     if (!ark_http_is_parked(http, ticket)) {
-        return;
+        return 0;
     }
 
     conn = &http->connections[ticket.conn_id];
     conn->waiting = 0;
-    conn->last_active_ms = context->now_ms;
-    conn->request_started_ms = context->now_ms;
+    conn->answering = 1;
 
-    http_send(context, ticket.conn_id, status, body, conn->keep_alive);
+    ark_memory_zero(request, sizeof(*request));
+    request->conn_id = ticket.conn_id;
+    request->keep_alive = conn->keep_alive;
 
-    /* Requests pipelined behind this one were held back until now. */
-    http_process_requests(context, ticket.conn_id, conn, handler, app);
+    return 1;
 }
