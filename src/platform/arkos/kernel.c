@@ -64,6 +64,65 @@ static void serial_write(const char *text, size_t length)
     }
 }
 
+/* Prints a number as 16 hex digits, like 000000000009FC00. */
+static void serial_write_hex(unsigned long value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char text[16];
+    int i;
+
+    for (i = 15; i >= 0; i--) {
+        text[i] = digits[value & 0xF];
+        value >>= 4;
+    }
+    serial_write(text, sizeof(text));
+}
+
+/* --- Memory map --------------------------------------------------------------
+ * The boot sector asked the BIOS which memory is free RAM and left the
+ * answer here. Must match MEMORY_MAP_ADDRESS in boot.asm. */
+
+#define MEMORY_MAP_ADDRESS 0x4000
+
+/* One piece of memory, exactly as the BIOS writes it (24 bytes). */
+typedef struct {
+    unsigned long start;
+    unsigned long length;
+    unsigned int type;   /* MEMORY_FREE, or something we must not touch. */
+    unsigned int extra;  /* Extra flags. Bit 0 clear means "ignore this entry". */
+} MemoryMapEntry;
+
+#define MEMORY_FREE 1
+
+typedef struct {
+    unsigned short count;
+    unsigned short padding[3];
+    MemoryMapEntry entries[1]; /* Really count entries. */
+} MemoryMap;
+
+static void memory_map_print(const MemoryMap *map)
+{
+    unsigned short i;
+
+    serial_write("memory map:\r\n", 13);
+    for (i = 0; i < map->count; i++) {
+        const MemoryMapEntry *entry = &map->entries[i];
+
+        if ((entry->extra & 1) == 0) {
+            continue;
+        }
+        serial_write("  ", 2);
+        serial_write_hex(entry->start);
+        serial_write(" - ", 3);
+        serial_write_hex(entry->start + entry->length - 1);
+        if (entry->type == MEMORY_FREE) {
+            serial_write("  free\r\n", 8);
+        } else {
+            serial_write("  taken\r\n", 9);
+        }
+    }
+}
+
 /* --- Start ------------------------------------------------------------------ */
 
 /* Set by kernel.ld: where uninitialized globals ("BSS") start and end. */
@@ -91,6 +150,7 @@ __attribute__((section(".text.start"))) void kernel_start(void)
 
     serial_init();
     serial_write(message, sizeof(message) - 1);
+    memory_map_print((const MemoryMap *)MEMORY_MAP_ADDRESS);
 
     halt_forever();
 }

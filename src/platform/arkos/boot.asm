@@ -3,9 +3,10 @@
 ; The BIOS copies it to address 0x7C00 and jumps to it, with the CPU in
 ; 16-bit "real mode". Its jobs:
 ;   1. Load the kernel from the disk into memory at KERNEL_ADDRESS.
-;   2. Set up page tables, which 64-bit mode requires.
-;   3. Switch the CPU straight from 16-bit mode to 64-bit "long mode".
-;   4. Jump to the kernel.
+;   2. Ask the BIOS for the memory map: which RAM is free.
+;   3. Set up page tables, which 64-bit mode requires.
+;   4. Switch the CPU straight from 16-bit mode to 64-bit "long mode".
+;   5. Jump to the kernel.
 ;
 ; The build passes KERNEL_SECTORS: how many 512-byte sectors the kernel uses.
 ; The kernel starts on the disk right after this sector.
@@ -18,6 +19,16 @@ SECTORS_PER_READ equ 64         ; 32 KiB per read. Some BIOSes can't do more.
 PML4_ADDRESS equ 0x1000         ; Level 4: one entry, pointing to the PDPT.
 PDPT_ADDRESS equ 0x2000         ; Level 3: one entry, pointing to the PD.
 PD_ADDRESS   equ 0x3000         ; Level 2: 512 entries of 2 MiB = the first 1 GiB.
+
+; The memory map from the BIOS goes here, for the kernel to read.
+; Must match MEMORY_MAP_ADDRESS in kernel.c. Layout:
+;   0x4000: 2-byte count of entries
+;   0x4008: the entries, 24 bytes each (start, length, type, extra flags)
+MEMORY_MAP_ADDRESS equ 0x4000
+MEMORY_MAP_ENTRIES equ MEMORY_MAP_ADDRESS + 8
+MEMORY_MAP_MAX     equ 128      ; 128 * 24 bytes fits below the stack.
+E820_ENTRY_SIZE    equ 24
+E820_MAGIC         equ 0x534D4150 ; "SMAP" in ASCII. The BIOS wants it in edx.
 
 PAGE_PRESENT  equ 1 << 0
 PAGE_WRITABLE equ 1 << 1
@@ -67,7 +78,33 @@ start:
     sub cx, [dap.count]
     jnz .read_chunk
 
-; --- 2. Page tables ----------------------------------------------------------
+; --- 2. Memory map -----------------------------------------------------------
+
+    ; Ask the BIOS (interrupt 0x15, function 0xE820) which memory is free RAM.
+    ; Each call writes one entry at es:di. ebx says where to continue next
+    ; time; the BIOS sets it to 0 after the last entry.
+    mov di, MEMORY_MAP_ENTRIES
+    xor ebx, ebx                ; 0 = start from the first entry.
+    xor bp, bp                  ; bp counts the entries we kept.
+.next_entry:
+    mov eax, 0xE820
+    mov edx, E820_MAGIC
+    mov ecx, E820_ENTRY_SIZE
+    mov dword [di + 20], 1      ; Default for the extra flags: "valid".
+    int 0x15
+    jc .map_done                ; Carry set: no more entries (or no support).
+    cmp eax, E820_MAGIC         ; A working BIOS echoes the magic back.
+    jne .map_done
+    add di, E820_ENTRY_SIZE     ; Keep this entry.
+    inc bp
+    cmp bp, MEMORY_MAP_MAX
+    je .map_done
+    test ebx, ebx
+    jnz .next_entry
+.map_done:
+    mov [MEMORY_MAP_ADDRESS], bp
+
+; --- 3. Page tables ----------------------------------------------------------
 
     ; In 64-bit mode every address goes through page tables. We map the first
     ; 1 GiB to itself ("identity map"), so address X still means memory at X.
@@ -95,9 +132,10 @@ start:
     add di, 8
     loop .fill_pd
 
-; --- 3. Switch to 64-bit mode ------------------------------------------------
+; --- 4. Switch to 64-bit mode ------------------------------------------------
 
     cli                         ; No interrupts: we have no handlers for them.
+
 
     ; Turn on the "A20 line". Without it, address bit 20 is always 0
     ; (an old PC compatibility trick). This is the fast way, via port 0x92.
@@ -137,7 +175,7 @@ disk_error:
     hlt
     jmp .halt
 
-; --- 4. Jump to the kernel ---------------------------------------------------
+; --- 5. Jump to the kernel ---------------------------------------------------
 
 [bits 64]
 long_mode:
