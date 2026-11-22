@@ -136,6 +136,14 @@ start:
 
     cli                         ; No interrupts: we have no handlers for them.
 
+    ; Silence the old interrupt chip (the 8259 PIC). cli only makes the CPU
+    ; ignore interrupts; the chip still raises them. Once the kernel turns
+    ; interrupts on, the timer would fire at a slot where the CPU expects
+    ; crash reports, and we'd crash. Masking every line (0xFF) on both chips
+    ; stops that. The kernel will use the newer APIC instead.
+    mov al, 0xFF
+    out 0xA1, al                ; Second chip: mask all 8 lines.
+    out 0x21, al                ; First chip: mask all 8 lines.
 
     ; Turn on the "A20 line". Without it, address bit 20 is always 0
     ; (an old PC compatibility trick). This is the fast way, via port 0x92.
