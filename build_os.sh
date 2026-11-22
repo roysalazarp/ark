@@ -14,11 +14,18 @@ mkdir -p "$OUT"
 #                        compiler must not keep data there
 #   -mgeneral-regs-only  no SSE/float registers: they are off until we enable them
 #   -fno-pic, -static    fixed addresses, set by kernel.ld
-KERNEL_FLAGS=(-std=c89 -Wall -Wextra -Wpedantic -g -O2
+#   -fno-tree-loop-distribute-patterns
+#                        don't turn loops into memset/memcpy calls; our own
+#                        memset is such a loop and would end up calling itself
+KERNEL_FLAGS=(-std=c89 -Wall -Wextra -Wpedantic -g -O2 -Iinclude
+              -fno-tree-loop-distribute-patterns
               -ffreestanding -nostdinc -isystem "$(gcc -print-file-name=include)"
               -fno-pic -fno-stack-protector -fno-asynchronous-unwind-tables
               -mno-red-zone -mgeneral-regs-only
               -nostdlib -static -no-pie -Wl,--build-id=none
+              # The kernel is loaded as one raw block that is writable and
+              # runnable. True, but known: our own page tables will fix it.
+              -Wl,--no-warn-rwx-segments
               -T "$SRC/kernel.ld")
 
 echo "Building kernel..."

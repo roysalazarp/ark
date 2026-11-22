@@ -8,6 +8,30 @@
 
 #include <stddef.h>
 
+#include <ark/platform.h>
+
+#define MB(n) ((unsigned long)(n) * 1024 * 1024)
+
+/* Same sizes the Linux platform uses. */
+#define PERMANENT_MEMORY_SIZE MB(64)
+#define TRANSIENT_MEMORY_SIZE MB(64)
+
+/* --- memset ------------------------------------------------------------------
+ * There is no C library, but GCC may still turn loops like "set all these
+ * bytes to 0" into a call to memset. So we must provide it ourselves.
+ * (build_os.sh passes -fno-tree-loop-distribute-patterns, so the loop below
+ * isn't itself turned into a call to memset, which would call itself forever.) */
+
+void *memset(void *destination, int value, size_t size)
+{
+    unsigned char *p = destination;
+
+    while (size--) {
+        *p++ = (unsigned char)value;
+    }
+    return destination;
+}
+
 /* --- Talking to hardware ports ---------------------------------------------
  * x86 devices like the serial port are reached through "ports", a separate
  * address space with its own instructions (in/out). C has no way to say that,
@@ -123,6 +147,67 @@ static void memory_map_print(const MemoryMap *map)
     }
 }
 
+/* --- App memory --------------------------------------------------------------
+ * Give the app its two blocks, permanent and transient, from free RAM above
+ * 1 MiB. Below 1 MiB is small and full of BIOS leftovers, the kernel and
+ * the page tables, so we leave it alone. */
+
+/* The boot sector's page tables only cover the first 1 GiB. Memory above
+ * that would crash us when touched, so the blocks must end below it. */
+#define MAPPED_MEMORY_END MB(1024)
+
+static ArkAppMemory app_memory;
+
+/* Returns 1 on success, 0 if there isn't enough free memory. */
+static int app_memory_setup(const MemoryMap *map)
+{
+    unsigned long needed = PERMANENT_MEMORY_SIZE + TRANSIENT_MEMORY_SIZE;
+    unsigned short i;
+
+    for (i = 0; i < map->count; i++) {
+        const MemoryMapEntry *entry = &map->entries[i];
+        unsigned long start = entry->start;
+        unsigned long end = entry->start + entry->length;
+
+        if (entry->type != MEMORY_FREE || (entry->extra & 1) == 0) {
+            continue;
+        }
+
+        /* Use only the part between 1 MiB and the end of mapped memory. */
+        if (start < MB(1)) {
+            start = MB(1);
+        }
+        if (end > MAPPED_MEMORY_END) {
+            end = MAPPED_MEMORY_END;
+        }
+        if (start >= end || end - start < needed) {
+            continue; /* Not big enough. Try the next one. */
+        }
+
+        /* Draw the two blocks, one after the other. */
+        app_memory.permanent = (void *)start;
+        app_memory.permanent_size = PERMANENT_MEMORY_SIZE;
+        app_memory.transient = (void *)(start + PERMANENT_MEMORY_SIZE);
+        app_memory.transient_size = TRANSIENT_MEMORY_SIZE;
+
+        /* The app expects both to start out as zeros. */
+        memset(app_memory.permanent, 0, app_memory.permanent_size);
+        memset(app_memory.transient, 0, app_memory.transient_size);
+        return 1;
+    }
+    return 0;
+}
+
+static void app_memory_print(void)
+{
+    serial_write("permanent: ", 11);
+    serial_write_hex((unsigned long)app_memory.permanent);
+    serial_write(" (64 MiB)\r\n", 11);
+    serial_write("transient: ", 11);
+    serial_write_hex((unsigned long)app_memory.transient);
+    serial_write(" (64 MiB)\r\n", 11);
+}
+
 /* --- Start ------------------------------------------------------------------ */
 
 /* Set by kernel.ld: where uninitialized globals ("BSS") start and end. */
@@ -151,6 +236,12 @@ __attribute__((section(".text.start"))) void kernel_start(void)
     serial_init();
     serial_write(message, sizeof(message) - 1);
     memory_map_print((const MemoryMap *)MEMORY_MAP_ADDRESS);
+
+    if (!app_memory_setup((const MemoryMap *)MEMORY_MAP_ADDRESS)) {
+        serial_write("not enough free memory for the app\r\n", 36);
+        halt_forever();
+    }
+    app_memory_print();
 
     halt_forever();
 }
