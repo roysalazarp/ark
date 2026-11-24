@@ -6,6 +6,31 @@
             "type": "shell",
             "command": "${workspaceFolder}/build.sh",
             "group": "build"
+        },
+        {
+            // Builds Ark OS and starts QEMU paused, waiting for the debugger.
+            // It keeps running in the background; "Debug Ark OS" connects to it.
+            "label": "arkos: start qemu for debugging",
+            "type": "shell",
+            "command": "${workspaceFolder}/build_os.sh debug",
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": { "regexp": "^__never_matches__$" },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "^Building kernel",
+                    // VS Code starts the debugger once this line shows up.
+                    "endsPattern": "^QEMU is waiting for the debugger"
+                }
+            }
+        },
+        {
+            // Stops QEMU when the debugging session ends. The [4] keeps the
+            // pattern from matching this command's own line.
+            "label": "arkos: stop qemu",
+            "type": "shell",
+            "command": "pkill -f 'qemu-system-x86_6[4].*-s -S' || true",
+            "presentation": { "reveal": "never" }
         }
     ]
 }

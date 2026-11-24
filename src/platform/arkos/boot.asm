@@ -34,8 +34,9 @@ PAGE_PRESENT  equ 1 << 0
 PAGE_WRITABLE equ 1 << 1
 PAGE_HUGE     equ 1 << 7        ; In the PD: the entry is a whole 2 MiB page.
 
+; This code runs at address 0x7C00. The linker sets that (see build_os.sh),
+; because we build an ELF file first so a debugger can show these lines.
 [bits 16]
-[org 0x7C00]
 
 start:
     ; The BIOS leaves the segment registers in an unknown state. Zero them,

@@ -31,6 +31,37 @@
             ],
             "preLaunchTask": "build",
             "serverLaunchTimeout": 5000
+        },
+        {
+            // Debugs Ark OS in QEMU. Runs until one of your breakpoints, in
+            // boot.asm or kernel.c (to stop at the very start, put one on the
+            // first line of boot.asm). The serial output shows in the task's
+            // terminal.
+            // Tip: stepping over "int 0x..." (a BIOS call) gets lost inside the
+            // BIOS. Use "Run to Cursor" on the next line instead.
+            "name": "Debug Ark OS",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/debug/arkos/kernel.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "miDebuggerServerAddress": "localhost:1234",
+            "stopAtEntry": false,
+            "setupCommands": [
+                { "text": "set confirm off" },
+                {
+                    "description": "Also load boot.asm's debug info",
+                    "text": "add-symbol-file ${workspaceFolder}/debug/arkos/boot.elf"
+                },
+                {
+                    "description": "The kernel runs as 64-bit x86 code",
+                    "text": "set architecture i386:x86-64",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "arkos: start qemu for debugging",
+            "postDebugTask": "arkos: stop qemu"
         }
     ]
 }

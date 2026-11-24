@@ -3,5 +3,7 @@
     "editor.tabSize": 4,
     "explorer.compactFolders": false,
     "files.associations": {},
-    "C_Cpp.errorSquiggles": "enabled"
+    "C_Cpp.errorSquiggles": "enabled",
+    // Lets you click to set breakpoints in boot.asm, not only in C files.
+    "debug.allowBreakpointsEverywhere": true
 }

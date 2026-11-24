@@ -19,16 +19,20 @@
 /* --- memset ------------------------------------------------------------------
  * There is no C library, but GCC may still turn loops like "set all these
  * bytes to 0" into a call to memset. So we must provide it ourselves.
- * (build_os.sh passes -fno-tree-loop-distribute-patterns, so the loop below
- * isn't itself turned into a call to memset, which would call itself forever.) */
+ *
+ * It uses "rep stosb", the CPU's own instruction for "store this byte size
+ * times": rdi = where, al = the byte, rcx = how many. Modern CPUs run it very
+ * fast, and it stays fast even in an unoptimized (-O0) build, where a plain
+ * C loop took over 40 seconds to clear the app's 128 MiB in QEMU. */
 
 void *memset(void *destination, int value, size_t size)
 {
-    unsigned char *p = destination;
+    void *d = destination;
 
-    while (size--) {
-        *p++ = (unsigned char)value;
-    }
+    __asm__ volatile("rep stosb"
+                     : "+D"(d), "+c"(size)
+                     : "a"(value)
+                     : "memory");
     return destination;
 }
 
