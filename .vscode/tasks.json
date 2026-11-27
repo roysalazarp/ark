@@ -25,6 +25,21 @@
             }
         },
         {
+            // Same as above, but with the pure assembly kernel (kernel.asm).
+            "label": "arkos: start qemu for debugging (asm)",
+            "type": "shell",
+            "command": "${workspaceFolder}/build_os.sh asm debug",
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": { "regexp": "^__never_matches__$" },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "^Building kernel",
+                    "endsPattern": "^QEMU is waiting for the debugger"
+                }
+            }
+        },
+        {
             // Stops QEMU when the debugging session ends. The [4] keeps the
             // pattern from matching this command's own line.
             "label": "arkos: stop qemu",

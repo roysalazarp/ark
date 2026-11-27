@@ -5,6 +5,12 @@
 #                             on port 1234. Connect from VS Code ("Debug Ark OS")
 #                             or from a terminal:
 #                               gdb debug/arkos/kernel.elf -ex "target remote :1234"
+#
+# Put "asm" first to use the pure assembly kernel (kernel.asm) instead of
+# the C one (kernel.c):
+#        ./build_os.sh asm
+#        ./build_os.sh asm run
+#        ./build_os.sh asm debug
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -12,6 +18,12 @@ cd "$(dirname "$0")"
 SRC="src/platform/arkos"
 OUT="debug/arkos"
 mkdir -p "$OUT"
+
+KERNEL_LANGUAGE="c"
+if [[ "${1:-}" == "asm" ]]; then
+    KERNEL_LANGUAGE="asm"
+    shift
+fi
 
 # Freestanding 64-bit kernel: no C library, no OS underneath.
 #   -O0                  no optimizing, so a debugger steps line by line
@@ -34,8 +46,16 @@ KERNEL_FLAGS=(-std=c89 -Wall -Wextra -Wpedantic -g -O0 -Iinclude
               -Wl,--no-warn-rwx-segments
               -T "$SRC/kernel.ld")
 
-echo "Building kernel..."
-gcc "${KERNEL_FLAGS[@]}" "$SRC/kernel.c" -o "$OUT/kernel.elf"
+if [[ "$KERNEL_LANGUAGE" == "asm" ]]; then
+    echo "Building kernel (assembly)..."
+    # Same linker script as the C kernel, so it lands at 0x10000 too.
+    nasm -f elf64 -g -F dwarf "$SRC/kernel.asm" -o "$OUT/kernel.o"
+    ld -m elf_x86_64 -T "$SRC/kernel.ld" -z noexecstack --build-id=none \
+        "$OUT/kernel.o" -o "$OUT/kernel.elf"
+else
+    echo "Building kernel (C)..."
+    gcc "${KERNEL_FLAGS[@]}" "$SRC/kernel.c" -o "$OUT/kernel.elf"
+fi
 # The boot sector can't read ELF files, so keep only the raw bytes.
 objcopy -O binary "$OUT/kernel.elf" "$OUT/kernel.bin"
 

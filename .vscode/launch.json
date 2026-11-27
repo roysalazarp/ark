@@ -62,6 +62,33 @@
             ],
             "preLaunchTask": "arkos: start qemu for debugging",
             "postDebugTask": "arkos: stop qemu"
+        },
+        {
+            // Same as "Debug Ark OS", but with the pure assembly kernel
+            // (kernel.asm). Put breakpoints in boot.asm or kernel.asm.
+            "name": "Debug Ark OS (asm)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/debug/arkos/kernel.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "miDebuggerServerAddress": "localhost:1234",
+            "stopAtEntry": false,
+            "setupCommands": [
+                { "text": "set confirm off" },
+                {
+                    "description": "Also load boot.asm's debug info",
+                    "text": "add-symbol-file ${workspaceFolder}/debug/arkos/boot.elf"
+                },
+                {
+                    "description": "The kernel runs as 64-bit x86 code",
+                    "text": "set architecture i386:x86-64",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "arkos: start qemu for debugging (asm)",
+            "postDebugTask": "arkos: stop qemu"
         }
     ]
 }
